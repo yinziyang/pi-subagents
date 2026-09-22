@@ -67,7 +67,7 @@ export default function subagents(pi: ExtensionAPI) {
 			getRuntime: () => parentRuntime(ctx.modelRegistry),
 			mainSession: () => ({ id: ctx.sessionManager.getSessionId(), file: ctx.sessionManager.getSessionFile() }),
 			isSelfExtension: (p) => resolve(p).startsWith(EXT_DIR + sep),
-			childExtension: (agentId, canNest) => (childPi) => registerSubagentTools(childPi, o, { callerId: agentId, canNest, forkMode: forkMode() }),
+			childExtension: (agentId, canNest, isFork) => (childPi) => registerSubagentTools(childPi, o, { callerId: agentId, canNest, forkMode: forkMode(), isFork }),
 			notifyMain: (text, details) => {
 				if (o.isClosed()) return;
 				pending.push({ text, details });
@@ -105,6 +105,22 @@ export default function subagents(pi: ExtensionAPI) {
 		for (const d of loaded.diagnostics) warn(`${d.path}：${d.message}`);
 		if (loaded.warning) warn(loaded.warning);
 		registerSubagentTools(pi, orch, { callerId: MAIN_ID, canNest: true, forkMode: forkMode() });
+	});
+
+	// /subtask：用户直接 fork 当前对话去做一项任务，不受并发上限阻挡，与 Claude Code 一致。
+	pi.registerCommand("subtask", {
+		description: "fork 当前对话，在后台执行一项任务，完成后结果送回主会话",
+		handler: async (args, ctx) => {
+			const task = args.trim();
+			if (!orch || !ctx.model) return;
+			if (!task) {
+				if (ctx.hasUI) ctx.ui.notify("用法：/subtask <任务>", "warning");
+				return;
+			}
+			const reply = await orch.spawnFork({ task, description: task.slice(0, 40) }, { id: MAIN_ID, cwd: ctx.cwd, model: ctx.model, thinkingLevel: pi.getThinkingLevel(), activeTools: pi.getActiveTools(), branch: () => ctx.sessionManager.getBranch() as never, sessionId: ctx.sessionManager.getSessionId() }, true);
+			if (ctx.hasUI) ctx.ui.notify(reply.text, reply.isError ? "error" : "info");
+			else if (reply.isError) console.error(`[pi-subagents] ${reply.text}`);
+		},
 	});
 
 	// /tree 切到另一条分支后，已结束的 agent 按那条分支还原；运行中的不受影响。

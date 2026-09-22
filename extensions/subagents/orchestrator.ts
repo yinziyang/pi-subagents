@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type AgentSessionEvent, type ExtensionFactory, loadSkills, type ModelRuntime, type SettingsManager, stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type AgentDefinition, resolveTools } from "./definitions.ts";
+import { buildForkEntries, type ForkEntry, forkDirective } from "./fork.ts";
 import { AgentRegistry, type AgentRecord, MAIN_ID } from "./registry.ts";
 import { addUsage, apiErrorMessage, formatReport, type RunOutcome, type UsageTotals } from "./report.ts";
 import { type ChildHandle, createChild, type RunResult } from "./runner.ts";
@@ -38,6 +39,12 @@ export interface Caller {
 	thinkingLevel: ThinkingLevel;
 	activeTools: string[];
 	signal?: AbortSignal;
+	/** 调用方当前分支的条目，fork 用。 */
+	branch?: () => ForkEntry[];
+	/** 调用方的会话 ID，fork 的请求沿用它以提高缓存命中。 */
+	sessionId?: string;
+	/** 通过 agent 工具发起时的工具调用 ID。 */
+	toolCallId?: string;
 }
 
 /** agent 工具的参数。 */
@@ -66,8 +73,11 @@ export interface OrchestratorDeps {
 	mainSession: () => { id: string; file?: string };
 	/** 判断扩展路径是否是本包自己。 */
 	isSelfExtension: (extensionPath: string) => boolean;
-	/** 注入子会话的扩展：注册 agent、send_message、task_stop 工具。canNest 为 false 时不注册 agent。 */
-	childExtension: (agentId: string, canNest: boolean) => ExtensionFactory;
+	/**
+	 * 注入子会话的扩展：注册 agent、send_message、task_stop 工具。
+	 * canNest 为 false 时不注册 agent；isFork 为 true 时总是注册 agent，保证工具定义与主会话一致，但禁止再派生 fork，到达深度上限时调用报错。
+	 */
+	childExtension: (agentId: string, canNest: boolean, isFork: boolean) => ExtensionFactory;
 	/** 把通知送进主会话。 */
 	notifyMain: (text: string, details: NotificationDetails) => void;
 	/** 给用户看的提示，例如模型解析失败时的替换说明。 */
@@ -126,6 +136,10 @@ export class Orchestrator {
 	async spawn(params: SpawnParams, caller: Caller, onProgress?: (record: AgentRecord) => void): Promise<ToolReply> {
 		if (this.closed) return { text: "会话正在关闭，不能再派出 subagent。", isError: true };
 		const typeName = params.subagent_type?.trim() || "general-purpose";
+		if (typeName === "fork") {
+			if (!this.deps.forkMode()) return { text: "fork 模式没有开启，不能派出 fork。请改用具体的 subagent 类型。", isError: true };
+			return this.spawnFork({ task: params.prompt, description: params.description, name: params.name }, caller);
+		}
 		const def = this.agents.get(typeName);
 		if (!def) return { text: `没有名为「${typeName}」的 subagent。可用的有：${[...this.agents.keys()].join("、")}`, isError: true };
 		const limit = this.registry.checkSpawn();
@@ -175,7 +189,7 @@ export class Orchestrator {
 				parentSessionId: this.deps.mainSession().id,
 				parentSessionFile: this.deps.mainSession().file,
 				isSelfExtension: this.deps.isSelfExtension,
-				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth))],
+				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth), false)],
 				settingsManager: this.deps.settingsManager,
 			});
 		} catch (err) {
@@ -189,6 +203,63 @@ export class Orchestrator {
 			return this.reply(record, def, result);
 		}
 		this.startBackground(record, handle, params.prompt, def.maxTurns, caller.id);
+		return { text: backgroundStarted(record), agentId: id };
+	}
+
+	/**
+	 * 派出一个 fork：继承调用方到此为止的整个对话，系统提示词、工具、模型与调用方一致，总在后台运行。
+	 * fromUser 为 true 表示用户用 /subtask 发起，不受并发上限阻挡，与 Claude Code 一致。
+	 */
+	async spawnFork(p: { task: string; description: string; name?: string }, caller: Caller, fromUser = false): Promise<ToolReply> {
+		if (this.closed) return { text: "会话正在关闭，不能再派出 fork。", isError: true };
+		if (this.registry.get(caller.id)?.fork) return { text: "fork 不能再派生 fork。需要委派时请改用具体的 subagent 类型。", isError: true };
+		if (!fromUser) {
+			const limit = this.registry.checkSpawn();
+			if (limit) return { text: limit, isError: true };
+		}
+		const branch = caller.branch?.();
+		const entries = branch && buildForkEntries(branch, { toolCallId: caller.toolCallId, newId: () => randomBytes(4).toString("hex"), now: Date.now, stripSignedThinking: caller.model.api === "anthropic-messages" });
+		if (!entries) return { text: "找不到发起 fork 的那条消息，无法构造 fork 的上下文。", isError: true };
+		const runtime = await this.deps.getRuntime();
+		const id = randomBytes(8).toString("hex");
+		const record = this.registry.add({
+			id,
+			name: p.name?.trim() || undefined,
+			type: "fork",
+			description: p.description,
+			parentId: caller.id,
+			background: true,
+			fork: true,
+			oneShot: false,
+			model: `${caller.model.provider}/${caller.model.id}`,
+			tools: caller.activeTools,
+		});
+		this.changed(record);
+		let handle: ChildHandle;
+		try {
+			handle = await createChild({
+				agentId: id,
+				cwd: caller.cwd,
+				agentDir: this.deps.agentDir,
+				runtime,
+				model: caller.model,
+				thinkingLevel: caller.thinkingLevel,
+				tools: caller.activeTools,
+				omitContextFiles: false,
+				source: { kind: "fork", dir: this.storageDir(), entries: entries as never },
+				parentSessionId: this.deps.mainSession().id,
+				parentSessionFile: this.deps.mainSession().file,
+				isSelfExtension: this.deps.isSelfExtension,
+				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth), true)],
+				routingSessionId: caller.sessionId,
+				settingsManager: this.deps.settingsManager,
+			});
+		} catch (err) {
+			this.finish(record, "failed", `创建 fork 失败：${errText(err)}`);
+			return { text: `fork 无法启动：${errText(err)}`, isError: true };
+		}
+		this.registry.update(id, { transcriptPath: handle.transcriptPath });
+		this.startBackground(record, handle, forkDirective(p.task), undefined, caller.id);
 		return { text: backgroundStarted(record), agentId: id };
 	}
 
@@ -225,7 +296,7 @@ export class Orchestrator {
 				source: { kind: "open", path: record.transcriptPath },
 				parentSessionId: this.deps.mainSession().id,
 				isSelfExtension: this.deps.isSelfExtension,
-				extensionFactories: [this.deps.childExtension(record.id, this.registry.canNest(record.depth))],
+				extensionFactories: [this.deps.childExtension(record.id, this.registry.canNest(record.depth), record.fork)],
 				settingsManager: this.deps.settingsManager,
 			});
 		} catch (err) {

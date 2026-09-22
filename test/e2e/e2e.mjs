@@ -61,7 +61,7 @@ function inspect(cwd) {
 				const cm = ce.filter((e) => e.type === "message").map((e) => e.message);
 				const system = cm.find((m) => m.role === "system");
 				const assistants = cm.filter((m) => m.role === "assistant");
-				const usage = assistants.reduce((u, m) => ({ input: u.input + (m.usage?.input ?? 0), output: u.output + (m.usage?.output ?? 0) }), { input: 0, output: 0 });
+				const usage = assistants.reduce((u, m) => ({ input: u.input + (m.usage?.input ?? 0), output: u.output + (m.usage?.output ?? 0), cacheRead: u.cacheRead + (m.usage?.cacheRead ?? 0) }), { input: 0, output: 0, cacheRead: 0 });
 				const toolCalls = assistants.flatMap((m) => (Array.isArray(m.content) ? m.content.filter((b) => b.type === "toolCall") : []));
 				const marker = ce.find((e) => e.type === "custom" && e.customType === "pi-subagents-child")?.data;
 				return { file: join(childDir, f), header: ce[0], marker, system: JSON.stringify(system ?? {}), sections: Object.keys(system?.sections ?? {}), messages: cm, entries: ce, toolCalls, usage, finalText: textOf(assistants[assistants.length - 1]) };
@@ -211,6 +211,27 @@ const scenarios = {
 		const sessionsDir = join(AGENT_DIR, "sessions");
 		const leaked = readdirSync(sessionsDir).some((d) => statSync(join(sessionsDir, d)).isDirectory() && readdirSync(join(sessionsDir, d)).some((f) => child && f.includes(child.header.id)));
 		check("子 agent 记录不在 pi 的会话目录里（/resume 列表看不到）", !leaked);
+		return cwd;
+	},
+
+	/** P5-4、P5-5：fork 继承上下文，并复用主会话的提示词缓存。 */
+	forkCache() {
+		const cwd = makeProject();
+		runPi(cwd, "暗号是 BLUE-42。现在在同一轮里一次性并行派出 5 个 fork（agent 工具，subagent_type 设为 fork），任务分别是「只回复：1 和暗号」「只回复：2 和暗号」「只回复：3 和暗号」「只回复：4 和暗号」「只回复：5 和暗号」，都不要调用工具。派出后这一轮只回复「已派出」。之后收到它们的结果通知时，只回复 done。", { env: { PI_FORK_SUBAGENT: "1" } });
+		const r = inspect(cwd);
+		const forks = r.children.filter((c) => c.header.parentSession && c.messages.some((m) => m.role === "user" && textOf(m).includes("fork 出来的子 agent")));
+		check("派出了 5 个 fork", forks.length === 5, `实际 ${forks.length}`);
+		check("每个 fork 都看到了主会话里的暗号", forks.length > 0 && forks.every((f) => f.finalText.includes("BLUE-42")), forks.map((f) => f.finalText).join(" | "));
+		const ratio = (u) => (u && u.input + u.cacheRead > 0 ? u.cacheRead / (u.input + u.cacheRead) : 0);
+		const forkRatios = forks.map((f) => {
+			const first = f.messages.slice(f.messages.findIndex((m) => m.role === "user" && textOf(m).includes("fork 出来的子 agent"))).find((m) => m.role === "assistant");
+			return ratio(first?.usage);
+		});
+		const mainAssistants = r.messages.filter((m) => m.role === "assistant");
+		const baseline = mainAssistants.slice(1).map((m) => ratio(m.usage));
+		console.log(`  fork 首次请求命中率：${forkRatios.map((x) => `${(x * 100).toFixed(1)}%`).join("、")}`);
+		console.log(`  主会话后续轮次命中率（基线）：${baseline.map((x) => `${(x * 100).toFixed(1)}%`).join("、")}`);
+		check("至少 4 个 fork 的首次请求缓存命中率超过 80%", forkRatios.filter((x) => x > 0.8).length >= 4);
 		return cwd;
 	},
 };
