@@ -213,3 +213,30 @@ test("界面回调抛异常不影响 agent：后台 agent 仍然报告为成功�
 		await h.close();
 	}
 });
+
+test("并发上限：同时运行的 subagent 达到上限时再派出报 Concurrent subagent limit reached，其余正常完成", async () => {
+	const h = await makeHarness({
+		env: { PI_SUBAGENT_MAX_CONCURRENT: "2" },
+		route: async (req) => {
+			if (isGeneralPurpose(req)) {
+				await sleep(150);
+				return text(`done-${req.lastUser}`);
+			}
+			if (isNotification(req.last)) return text("收到");
+			if (lastToolResult(req)) return text("已派出");
+			return fauxAssistantMessage(["a", "b", "c"].map((p, i) => toolCall("agent", { description: `任务${p}`, prompt: p }, `k${i}`)), { stopReason: "toolUse" });
+		},
+	});
+	try {
+		await h.prompt("开始");
+		await h.session.agent.waitForIdle();
+		const results = (h.session.messages as any[]).filter((m) => m.role === "toolResult" && m.toolName === "agent");
+		const refused = results.filter((m) => m.isError);
+		assert.equal(refused.length, 1, "第 3 个被拒绝");
+		assert.match(resultText(refused[0]), /^Concurrent subagent limit reached/);
+		const delivered = notifications(h.session).flatMap((m) => m.details.agents);
+		assert.equal(delivered.length, 2, "前 2 个正常完成并送回");
+	} finally {
+		await h.close();
+	}
+});

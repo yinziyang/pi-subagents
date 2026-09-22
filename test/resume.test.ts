@@ -152,3 +152,31 @@ test("工具执行期间被停止：状态是 stopped 而不是 failed", async (
 		await h.close();
 	}
 });
+
+test("主会话压缩之后，之前的 agent 仍能按名字续聊，记录文件不受影响", async () => {
+	let phase = 1;
+	const h = await makeHarness({
+		settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+		route: (req) => {
+			if (isGeneralPurpose(req)) return text(JSON.stringify(req.messages).includes("记住数字 9") && req.lastUser.includes("数字是几") ? "数字是 9" : "记住了");
+			if (isNote(req.last)) return text("压缩后续聊成功");
+			if (lastToolResult(req)) return text("完成");
+			if (phase === 1) return call("agent", { description: "记数字", prompt: "记住数字 9", name: "keeper9", run_in_background: false });
+			if (phase === 2) return text("这是压缩摘要：派出过 keeper9。");
+			return call("send_message", { to: "keeper9", message: "数字是几？" });
+		},
+	});
+	try {
+		await h.prompt("第一轮");
+		await h.prompt("再聊一句，让会话足够压缩");
+		phase = 2;
+		await h.session.compact();
+		assert.ok(h.session.sessionManager.getBranch().some((e: any) => e.type === "compaction"), "主会话确实压缩过");
+		phase = 3;
+		await h.prompt("第三轮");
+		assert.match(resultText(toolResults(h, "send_message")[0]), /已在后台恢复运行/);
+		assert.match(resultText(notifications(h.session)[0]), /数字是 9/);
+	} finally {
+		await h.close();
+	}
+});

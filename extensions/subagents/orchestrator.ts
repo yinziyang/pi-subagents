@@ -142,6 +142,8 @@ export class Orchestrator {
 		}
 		const def = this.agents.get(typeName);
 		if (!def) return { text: `没有名为「${typeName}」的 subagent。可用的有：${[...this.agents.keys()].join("、")}`, isError: true };
+		// 先拿运行时：从检查并发上限到登记记录之间不能有任何 await，否则同一轮并行的调用会一起通过检查。
+		const runtime = await this.deps.getRuntime();
 		const limit = this.registry.checkSpawn();
 		if (limit) return { text: limit, isError: true };
 		const depth = this.registry.depthOf(caller.id) + 1;
@@ -150,8 +152,6 @@ export class Orchestrator {
 		const available = unique([...caller.activeTools.filter((t) => !OWN_TOOLS.includes(t)), ...EXTRA_READ_TOOLS, ...(canNest ? [TOOL_AGENT] : []), TOOL_SEND, TOOL_STOP]);
 		const resolved = resolveTools(def, available);
 		if ("error" in resolved) return { text: `subagent「${def.name}」无法启动：${resolved.error}`, isError: true };
-
-		const runtime = await this.deps.getRuntime();
 		const { model, warning } = resolveModel(params.model ?? def.model, this.deps.env.PI_SUBAGENT_MODEL, caller.model, runtime, params.model === undefined && def.model === "inherit");
 		if (warning) this.deps.warn(warning);
 		const background = this.decideBackground(def, params);
@@ -213,6 +213,8 @@ export class Orchestrator {
 	async spawnFork(p: { task: string; description: string; name?: string }, caller: Caller, fromUser = false): Promise<ToolReply> {
 		if (this.closed) return { text: "会话正在关闭，不能再派出 fork。", isError: true };
 		if (this.registry.get(caller.id)?.fork) return { text: "fork 不能再派生 fork。需要委派时请改用具体的 subagent 类型。", isError: true };
+		// 同 spawn：从检查并发上限到登记记录之间不能有 await。
+		const runtime = await this.deps.getRuntime();
 		if (!fromUser) {
 			const limit = this.registry.checkSpawn();
 			if (limit) return { text: limit, isError: true };
@@ -220,7 +222,6 @@ export class Orchestrator {
 		const branch = caller.branch?.();
 		const entries = branch && buildForkEntries(branch, { toolCallId: caller.toolCallId, newId: () => randomBytes(4).toString("hex"), now: Date.now, stripSignedThinking: caller.model.api === "anthropic-messages" });
 		if (!entries) return { text: "找不到发起 fork 的那条消息，无法构造 fork 的上下文。", isError: true };
-		const runtime = await this.deps.getRuntime();
 		const id = randomBytes(8).toString("hex");
 		const record = this.registry.add({
 			id,
@@ -486,7 +487,7 @@ export class Orchestrator {
 			toolCalls: r.toolCalls,
 			usage: r.usage,
 			transcriptPath: r.transcriptPath,
-			resumable: !r.oneShot,
+			resumable: !r.oneShot && !r.cancelledByUser,
 			background: r.background,
 		});
 		return { text, usage: r.usage, agentId: r.id };
@@ -553,7 +554,7 @@ function backgroundStarted(r: AgentRecord): string {
 }
 
 function formatReportFor(record: AgentRecord, result: RunResult): string {
-	return formatReport({ agentType: record.type, agentId: record.id, name: record.name, outcome: result.outcome, durationMs: result.durationMs, toolCalls: record.toolCalls, usage: record.usage, transcriptPath: record.transcriptPath, resumable: !record.oneShot, background: true });
+	return formatReport({ agentType: record.type, agentId: record.id, name: record.name, outcome: result.outcome, durationMs: result.durationMs, toolCalls: record.toolCalls, usage: record.usage, transcriptPath: record.transcriptPath, resumable: !record.oneShot && !record.cancelledByUser, background: true });
 }
 
 function summaryOf(o: RunOutcome): string {

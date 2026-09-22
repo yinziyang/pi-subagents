@@ -44,6 +44,8 @@ export interface HarnessOptions {
 	notes?: string[];
 	/** 为 true 时界面的 setStatus 抛异常，用来验证界面故障不影响 agent。 */
 	brokenUi?: boolean;
+	/** 合并进测试用 settings.json 的设置。 */
+	settings?: Record<string, unknown>;
 }
 
 const systemOf = (messages: any[]) => {
@@ -60,7 +62,7 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(agentDir, { recursive: true });
 	// 关掉自动重试，模型出错的用例才不会等退避。
-	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false } }));
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false }, ...opts.settings }));
 	for (const [file, content] of Object.entries(opts.agents ?? {})) {
 		mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
 		writeFileSync(join(cwd, ".pi", "agents", file), content);
