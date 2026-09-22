@@ -9,11 +9,11 @@
 ## 安装
 
 ```bash
-pi install git:git@github.com:yinziyang/pi-subagents
+pi install git:git@github.com:yinziyang/pi-subagents.git
 ```
 
 需要 pi 0.87.0 或更高版本。
-安装后新开一个 pi 会话，启动信息的 Extensions 列表里会出现 `subagents`。
+安装后新开一个 pi 会话，启动信息的 Extensions 列表里会出现 `yinziyang/pi-subagents:subagents`。
 
 ## 用法
 
