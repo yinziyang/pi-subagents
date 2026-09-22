@@ -1,0 +1,38 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "description": "Claude Code–style subagents for the pi coding agent: isolated contexts, background runs, forks, resume, and a live agent panel.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "repository": "github:yinziyang/pi-subagents",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "subagents",
+    "claude-code"
+  ],
+  "files": [
+    "extensions",
+    "agents",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/subagents/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.87.0",
+    "@earendil-works/pi-coding-agent": "^0.87.0",
+    "typebox": "^1.3.27"
+  }
+}

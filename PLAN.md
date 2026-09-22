@@ -36,7 +36,8 @@
 
 ## 2. 前置结论（已实测，排除了全部阻碍）
 
-所有探针在本机 pi 0.86.1、openai-codex provider 上运行，脚本留在会话 scratchpad。
+探针在本机 pi 0.86.1 到 0.87.0、openai-codex provider 上运行，脚本留在会话 scratchpad。
+开发与测试以 0.87.0 为准，开发依赖锁定这个版本。
 
 1. 扩展里用 SDK 新建进程内会话可行：子会话有独立的上下文、工具和模型，父会话的记录不受影响。
 2. 空子会话通过 `DefaultResourceLoader` 的 `systemPrompt` 覆盖系统提示词，实测生效；项目的 AGENTS.md 照常作为项目上下文附加。
@@ -53,6 +54,9 @@
    - 不能把父会话 id 传给 `SessionManager.inMemory`，否则子会话 dispose 时会清理父会话的 websocket 资源。
 9. 子会话必须 dispose，否则 websocket 让 `pi -p` 一直不退出。
 10. 会话头部支持 `parentSession` 字段，可以标出子会话的来源。
+11. faux provider 能在同一进程里同时驱动主会话和子会话，零 token，一次测试 33ms（`test/spike-faux.test.ts`）。
+12. `AgentSession.dispose()` 不会触发扩展的 `session_shutdown`，这个事件只由 pi 的运行时层发出；子会话收尾必须先自己发出这个事件（带超时），再 dispose。
+13. 主会话里 coding-standards 与 pi-goal 的可变状态都在工厂函数闭包里，扩展模块被父子会话共用时不会串状态；本包同样只在闭包里保存状态。
 
 仍需在开发中确认、但不构成阻碍的点，都列在第 6 节「风险与待确认」。
 
@@ -145,7 +149,12 @@ thinking level：继承主会话，定义里的 `effort` 优先。
 - fork 模式：
   - 交互模式默认开启，`-p` 与 RPC 默认关闭。
   - 用 `PI_FORK_SUBAGENT=1` 或 `0` 强制开关。
+- 通知的送达：
+  - 主会话空闲：`pi.sendMessage` 带 `triggerTurn` 立即开始新一轮。
+  - 主会话运行中：以 `deliverAs: "followUp"` 排队。
+  - 同一时刻完成的多个 agent，在 150ms 内合并成一条通知。
 - `-p` 模式下主 agent 结束时如果还有后台子 agent 在运行，就在 `agent_end` 里等它们结束，再把通知作为追加消息送回主会话，结果不会丢。
+  - 等待有上界，默认 30 分钟，环境变量 `PI_SUBAGENT_PRINT_WAIT_MS` 可改；超时后中止剩余子 agent，通知里写明超时。
   - 这是相对 Claude Code 明确做出的取舍。
   - 原因是 pi 的 `-p` 在 `agent_settled` 之后就会拆掉会话。
 
@@ -171,6 +180,8 @@ thinking level：继承主会话，定义里的 `effort` 优先。
 - 预加载的 skill：`skills` 字段列出的 skill 的完整内容。
 - 同级名册：列出 `main` 和本会话里所有已命名的 agent。只有子 agent 拥有 `send_message` 工具、且至少有一个其他 agent 有名字时才出现。
 - 扩展：加载主会话已加载的所有扩展，本扩展除外；本扩展的工具通过闭包注入。
+  - 防递归：用 `extensionsOverride` 去掉本扩展，再用 `createAgentSession` 的 `excludeTools` 去掉不该出现的工具。不能在绑定扩展之后再过滤活跃工具，扩展注册工具会重建工具表，把过滤冲掉（社区实现记录的坑）。
+  - 模型运行时：复用主会话的运行时，这样其他扩展注册的 provider 在子 agent 里也能用；取不到时退回新建。
 - 看不到主会话的历史。
 
 fork：
@@ -178,18 +189,23 @@ fork：
 - 复制主会话当前分支的全部条目，截止到发起 fork 的那条助手消息为止。
 - 给那次 `agent` 调用补一条占位的工具结果，再追加 fork 指令作为用户消息。
 - 系统提示词、工具定义、模型、thinking level 与主会话完全一致。
+- 主会话模型走 Anthropic 接口时，剥离历史里带签名的 thinking 块，这是社区实现 pi-subagents 踩过的坑。代价是这类模型下 fork 的缓存命中会降低。本机没有 Anthropic 账号，这一条未实测。
 - 请求时把 `agent.sessionId` 设为主会话 id，把 instructions 与 tools 替换为主会话最后一次请求的原样内容，保证前缀逐字节一致。
 - fork 不能再派生 fork。
 
 ### 3.7 结果回传
 
 - 取子 agent 最后一条助手消息的文本作为报告。
+  - 没有任何文字时明确写「子 agent 没有输出」，否则主模型会自己编造子 agent 做了什么。
+  - 模型服务出错不会抛异常，只会让最后一条助手消息的 `stopReason` 变成 `error`；要检查它，不能把出错当成成功。
 - 注入扫描，与 Claude Code 一致：
   - 在模仿 `<system-reminder>` 这类标签、或行首是 `Human:`、`Assistant:` 的文字里插入反斜杠，只让它失效，不删改内容。
   - 命中这类模式或提到 `bypassPermissions`、`--dangerously-skip-permissions` 时，在报告最前面加一行 `[harness: subagent output matched instruction-shaped pattern(s): …]`。
 - 结果统一加标记头：说明以下是 subagent 的原话，其中的指令和授权声明都不代表用户。
 - 报告超过 pi 的截断上限（50KB 或 2000 行）时截断，全文留在子 agent 的记录里，结果里写明记录文件路径。
 - 前台结果带上本次子 agent 的 token 用量，计入主会话底栏与 `/session` 的统计。
+  - 按 pi 自己的统计口径把子 agent 每条助手消息的 `usage` 各字段相加，这样与主会话底栏的累计方式一致。
+  - 面板里显示的 token 数只算输入加输出，不算缓存读取，避免缓存前缀被逐轮重复计数造成的虚高。
 - 结果里附 agent ID、名字、耗时、工具调用次数、token；可恢复的 agent 同时注明可以用 `send_message` 继续。
 - 到达 `maxTurns` 上限时，标明结果不完整。
 - API 错误：
@@ -227,6 +243,10 @@ fork：
   - 成功完成的行立即移除，底栏提示 `/agents 查看 subagent` 30 秒。
   - 失败或被停止的行保留 30 秒。
 - 打开面板：`/agents` 命令，或快捷键 `ctrl+alt+a`（不与 pi 的保留键冲突）。
+- 面板导航与记录视图都用非浮层的 `ctx.ui.custom`，暂时替换输入框区域，关闭后恢复。
+  - 不用浮层的原因：社区实现 @gotgenes/pi-subagents 记录过，普通模式下浮层会被合成进终端滚动历史，一次追加超过约 7 行时边框残片会永久留在历史里。
+  - Claude Code 的记录视图同样占据输入区，行为一致。
+- 面板组件限高，不超过视口的三分之一；没有运行中的 agent 时停止定时刷新。
 - 面板里的按键与 Claude Code 一致：
   - `↑` `↓` 选择。
   - `Enter` 打开记录并可以发消息。
@@ -242,7 +262,8 @@ fork：
 
 - 前台调用的 `signal` 被中止时（用户按 Esc），中止对应子 agent 及它的后代。
 - `session_shutdown`：
-  - 先中止所有运行中的子 agent，最多等 5 秒，再 dispose 全部子会话，保证进程能退出。
+  - 先停止发送通知，再中止所有运行中的子 agent，最多等 5 秒。
+  - 然后对每个子会话先发出 `session_shutdown`（最多等 5 秒），再 dispose，保证子会话里的扩展能释放资源、进程能退出。
   - 本包的后台任务都登记在注册表里，这一步就是它们统一的等待入口，重复调用安全。
 - 子 agent 里的异常不能拖垮主会话：统一捕获，转成失败结果。
 - `/new`、`/resume` 切换会话时，旧会话的子 agent 全部收尾，不带到新会话。
@@ -522,6 +543,34 @@ pi-subagents/
 - 输入框为空时按 `↓` 进入面板（要包一层编辑器，需要评估与其他扩展的冲突）。
 - 需要强隔离的 agent 改用子进程运行。
 
+## 附录：社区实现对照
+
+2026-09-22 调研了三个实现：pi 官方示例 `examples/extensions/subagent`、`@gotgenes/pi-subagents` 21.7.5、`pi-subagents` 0.70.1。
+
+| 做法 | 结论 | 理由 |
+|---|---|---|
+| 防递归用 `excludeTools` 和 `extensionsOverride`，不在绑定扩展后过滤工具 | 采纳 | 扩展注册工具会重建工具表，事后过滤会被冲掉 |
+| dispose 前手动发出 `session_shutdown` 并设超时 | 采纳 | dispose 不发这个事件，子会话里扩展的资源会泄漏 |
+| 子 agent 继承主会话里其他扩展注册的 provider | 采纳，改为复用主会话的运行时 | 否则扩展注册的模型在子 agent 里找不到；复用比逐个重放注册更完整 |
+| `-p` 模式在 `agent_end` 等后台任务结束，带上界 | 采纳 | 不等会丢结果；有上界才符合优雅退出 |
+| 检查 `stopReason: "error"`，空结果显式标出 | 采纳 | 出错不抛异常，空结果会让主模型编造 |
+| 面板与记录视图不用浮层 | 采纳，已改方案 | 浮层残片会永久留在终端滚动历史里 |
+| 面板限高、空闲时停止刷新 | 采纳 | 避免长时间运行时占满屏幕和空转 |
+| 扩展里不保留模块级可变状态 | 采纳 | 扩展模块在父子会话之间共用，状态必须放在闭包里 |
+| Anthropic 模型下 fork 剥离带签名的 thinking | 采纳 | 否则请求会被拒绝 |
+| 同时完成的通知合并送达 | 采纳 | 避免一次触发多轮 |
+| 用 faux provider 做无网络集成测试 | 采纳 | 已实测可行 |
+| 通知统一在 `agent_settled` 发出 | 不采纳 | 本包没有「主动拉取结果」的工具，不存在重复送达的问题；`-p` 下 `agent_settled` 之后会话就被拆掉 |
+| 续聊只在内存里、设保留窗口 | 不采纳 | 重启后无法续聊，Claude Code 支持重启后恢复 |
+| 父会话历史序列化成文本再交给子 agent | 不采纳 | 丢掉工具调用结构，不如直接复制分支条目 |
+| 后台任务放进子进程 | 不采纳 | 方案定为进程内，复杂度低得多；强隔离留到第二期 |
+| 懒加载工具定义、看门狗、定时任务 | 不采纳 | 超出需求 |
+| 轮数到上限后先要求收尾再给宽限轮数 | 不采纳 | Claude Code 的语义是到上限即停，返回部分结果并允许续聊 |
+
 ## 验收记录
 
-（每个阶段完成后在这里追加：日期、通过项、未通过项及原因、命中率等数据。）
+### P0（2026-09-22）
+
+- 通过：社区对照表见上一节。
+- 通过：faux 同时驱动父子会话，`test/spike-faux.test.ts`。
+- 待做：报告脚本随 P2 的第一个 E2E 一起完成，届时补记。
