@@ -62,9 +62,9 @@ export interface RunOutcome {
 export function extractOutcome(messages: readonly MessageLike[], opts: { aborted?: boolean; hitMaxTurns?: boolean } = {}): RunOutcome {
 	const assistants = messages.filter((m) => m.role === "assistant");
 	const last = assistants[assistants.length - 1];
-	let text = last ? textOf(last.content) : "";
+	let text = last ? messageText(last.content) : "";
 	if (!text) {
-		for (let i = assistants.length - 2; i >= 0 && !text; i--) text = textOf(assistants[i].content);
+		for (let i = assistants.length - 2; i >= 0 && !text; i--) text = messageText(assistants[i].content);
 	}
 	if (opts.hitMaxTurns) return { text, kind: "maxTurns" };
 	if (opts.aborted || last?.stopReason === "aborted") return { text, kind: "aborted" };
@@ -191,7 +191,8 @@ export function formatTokens(n: number): string {
 	return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
-function textOf(content: unknown): string {
+/** 消息内容里的全部文字，去掉首尾空白；内容可以是字符串或内容块数组。 */
+export function messageText(content: unknown): string {
 	if (typeof content === "string") return content.trim();
 	if (!Array.isArray(content)) return "";
 	return content
@@ -199,6 +200,20 @@ function textOf(content: unknown): string {
 		.map((b) => (b as { text: string }).text)
 		.join("")
 		.trim();
+}
+
+/** 把文字压成一行，超过 max 个字符时截断并加省略号。 */
+export function oneLine(text: string, max = 80): string {
+	const s = text.replace(/\s+/g, " ").trim();
+	return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+/** 工具调用参数的一行摘要：优先取命令、路径、模式这类最能说明意图的字段。 */
+export function briefArgs(args: unknown, max = 80): string {
+	if (!args || typeof args !== "object") return "";
+	const a = args as Record<string, unknown>;
+	const v = a.command ?? a.path ?? a.pattern ?? a.description ?? a.to ?? Object.values(a)[0];
+	return typeof v === "string" ? oneLine(v, max) : "";
 }
 
 function num(v: unknown): number {

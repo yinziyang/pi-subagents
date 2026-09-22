@@ -152,3 +152,21 @@ test("renderAgentRoster 列出名字、描述与工具", () => {
 	assert.match(roster, /^- general-purpose: .*\(Tools: All tools\)$/m);
 	assert.match(roster, /^- Explore: .*\(Tools: read, grep, find, ls, bash\)$/m);
 });
+
+test("resolveModel：调用参数 > 定义 > PI_SUBAGENT_MODEL > 调用方模型；inherit 不看环境变量；找不到时退回并说明", async () => {
+	const { resolveModel, effortToThinking } = await import("../extensions/subagents/definitions.ts");
+	const main = { provider: "p1", id: "main" };
+	const models = [main, { provider: "p1", id: "fast", name: "Fast" }, { provider: "p2", id: "fast" }, { provider: "p2", id: "big" }];
+	const src = { getModel: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id), getModels: () => models };
+	assert.equal(resolveModel("p2/big", "p1/fast", main, src).model.id, "big", "调用参数或定义优先于环境变量");
+	assert.equal(resolveModel(undefined, "p2/big", main, src).model.id, "big", "都没写时用环境变量");
+	assert.equal(resolveModel(undefined, undefined, main, src).model, main, "都没有时用调用方模型");
+	assert.equal(resolveModel("inherit", "p2/big", main, src, true).model, main, "定义写 inherit 时不看环境变量");
+	assert.deepEqual(resolveModel("fast", undefined, main, src).model, { provider: "p1", id: "fast", name: "Fast" }, "只写模型名时优先同一 provider");
+	const miss = resolveModel("p9/nope", undefined, main, src);
+	assert.equal(miss.model, main);
+	assert.match(miss.warning ?? "", /找不到模型「p9\/nope」，subagent 改用 p1\/main/);
+	assert.equal(effortToThinking("max"), "xhigh");
+	assert.equal(effortToThinking("low"), "low");
+	assert.equal(effortToThinking(undefined), undefined);
+});

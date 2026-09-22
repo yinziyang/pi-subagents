@@ -11,10 +11,10 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type AgentSessionEvent, type ExtensionFactory, loadSkills, type ModelRuntime, type SettingsManager, stripFrontmatter } from "@earendil-works/pi-coding-agent";
-import { type AgentDefinition, resolveTools } from "./definitions.ts";
+import { type AgentDefinition, effortToThinking, resolveModel, resolveTools } from "./definitions.ts";
 import { buildForkEntries, type ForkEntry, forkDirective } from "./fork.ts";
 import { AgentRegistry, type AgentRecord, MAIN_ID } from "./registry.ts";
-import { addUsage, apiErrorMessage, formatReport, type RunOutcome, type UsageTotals } from "./report.ts";
+import { addUsage, apiErrorMessage, briefArgs, formatReport, messageText, oneLine, type RunOutcome, type UsageTotals } from "./report.ts";
 import { type ChildHandle, createChild, type RunResult } from "./runner.ts";
 
 /** 本包提供给模型的工具名。 */
@@ -180,7 +180,7 @@ export class Orchestrator {
 				agentDir: this.deps.agentDir,
 				runtime,
 				model,
-				thinkingLevel: effortToThinking(def.effort) ?? caller.thinkingLevel,
+				thinkingLevel: (effortToThinking(def.effort) as ThinkingLevel | undefined) ?? caller.thinkingLevel,
 				tools: resolved.tools,
 				systemPrompt: def.systemPrompt || undefined,
 				appendSystemPrompt: this.preloadSkills(def, caller.cwd),
@@ -291,7 +291,7 @@ export class Orchestrator {
 				agentDir: this.deps.agentDir,
 				runtime,
 				model,
-				thinkingLevel: effortToThinking(def?.effort) ?? caller.thinkingLevel,
+				thinkingLevel: (effortToThinking(def?.effort) as ThinkingLevel | undefined) ?? caller.thinkingLevel,
 				tools: record.tools,
 				omitContextFiles: def?.omitContextFiles === true,
 				source: { kind: "open", path: record.transcriptPath },
@@ -450,10 +450,10 @@ export class Orchestrator {
 		if (!r) return;
 		if (e.type === "tool_execution_start") {
 			r.toolCalls++;
-			r.activity = `${e.toolName} ${briefArgs(e.args)}`.trim();
+			r.activity = `${e.toolName} ${briefArgs(e.args, 60)}`.trim();
 		} else if (e.type === "message_end" && e.message.role === "assistant") {
 			addUsage(r.usage, (e.message as { usage?: unknown }).usage);
-			const text = textOf((e.message as { content?: unknown }).content);
+			const text = messageText((e.message as { content?: unknown }).content);
 			if (text) r.activity = oneLine(text);
 		} else return;
 		this.registry.update(r.id, {});
@@ -522,32 +522,6 @@ export class Orchestrator {
 	}
 }
 
-/**
- * 按 Claude Code 的顺序解析子 agent 的模型：调用参数、定义里的 model、PI_SUBAGENT_MODEL、调用方的模型。
- * 定义写 inherit 时直接用调用方的模型，不再看环境变量。
- * 找不到时退回调用方的模型并给出说明。
- */
-export function resolveModel(spec: string | undefined, envModel: string | undefined, fallback: Model, runtime: Pick<ModelRuntime, "getModel" | "getModels">, inheritExplicit = false): { model: Model; warning?: string } {
-	const wanted = spec && spec !== "inherit" ? spec : inheritExplicit ? undefined : envModel?.trim() || undefined;
-	if (!wanted || wanted === "inherit") return { model: fallback };
-	const slash = wanted.indexOf("/");
-	let found: Model | undefined;
-	if (slash > 0) found = runtime.getModel(wanted.slice(0, slash), wanted.slice(slash + 1)) as Model | undefined;
-	if (!found) {
-		const all = runtime.getModels() as readonly Model[];
-		const matches = all.filter((m) => m.id === wanted || m.name === wanted);
-		found = matches.find((m) => m.provider === fallback.provider) ?? matches[0];
-	}
-	if (found) return { model: found };
-	return { model: fallback, warning: `找不到模型「${wanted}」，subagent 改用 ${fallback.provider}/${fallback.id}` };
-}
-
-/** Claude Code 的 effort 映射到 pi 的 thinking level；max 映射到 pi 的最高档 xhigh，实际会按模型能力再截断。 */
-export function effortToThinking(effort: AgentDefinition["effort"]): ThinkingLevel | undefined {
-	if (!effort) return undefined;
-	return (effort === "max" ? "xhigh" : effort) as ThinkingLevel;
-}
-
 function backgroundStarted(r: AgentRecord): string {
 	const who = `subagent「${r.type}」${r.name ? `（名字：${r.name}）` : ""}，agent ID：${r.id}`;
 	return `已在后台启动 ${who}。它完成后，结果会以一条自动通知送回。在收到通知之前，不要自己推测或编造它的结果，也不要重复派出同样的任务；可以继续做其他不依赖它的事。`;
@@ -560,24 +534,6 @@ function formatReportFor(record: AgentRecord, result: RunResult): string {
 function summaryOf(o: RunOutcome): string {
 	if (o.kind === "error") return `出错：${o.errorMessage}`;
 	return oneLine(o.text) || "（没有输出）";
-}
-
-function briefArgs(args: unknown): string {
-	if (!args || typeof args !== "object") return "";
-	const a = args as Record<string, unknown>;
-	const v = a.command ?? a.path ?? a.pattern ?? a.description ?? a.to ?? Object.values(a)[0];
-	return typeof v === "string" ? oneLine(v, 60) : "";
-}
-
-function textOf(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content.map((b) => (b && typeof b === "object" && (b as { type?: string }).type === "text" ? String((b as { text?: unknown }).text ?? "") : "")).join("");
-}
-
-function oneLine(text: string, max = 80): string {
-	const s = text.replace(/\s+/g, " ").trim();
-	return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
 function unique<T>(items: T[]): T[] {

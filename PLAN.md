@@ -585,7 +585,7 @@ pi-subagents/
 
 ### P2（2026-09-22）
 
-- 通过：单测 1、2（`test/report.test.ts`；模型解析顺序在 P2 集成测试与 E2E 中覆盖）。
+- 通过：单测 1（`test/report.test.ts`）、单测 2（`test/definitions.test.ts` 的 resolveModel 用例；收尾自检时发现原先缺这个单测，已补上）。
 - 通过：集成 3 到 6（`test/foreground.test.ts`）。
 - 通过：E2E 7 到 12（`isolation`、`systemPrompt`、`extensions`、`tools`、`usage`）。
   - 首轮发现内置 Explore、Plan 附加了项目 AGENTS.md，已在定义里补上 `omitClaudeMd: true`。

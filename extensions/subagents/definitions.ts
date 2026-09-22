@@ -240,6 +240,45 @@ export function resolveTools(def: Pick<AgentDefinition, "tools" | "disallowedToo
 	return { tools };
 }
 
+/** 模型解析只用到的字段，与 pi 的 Model 兼容。 */
+export interface ModelLike {
+	provider: string;
+	id: string;
+	name?: string;
+}
+
+/** 可以按 provider 与 ID 查模型、也能列出全部模型的来源，与 pi 的 ModelRuntime 兼容。 */
+export interface ModelSource<M> {
+	getModel(provider: string, id: string): M | undefined;
+	getModels(): readonly M[];
+}
+
+/**
+ * 按 Claude Code 的顺序解析子 agent 的模型：调用参数、定义里的 model、PI_SUBAGENT_MODEL、调用方的模型。
+ * 定义写 inherit 时直接用调用方的模型，不再看环境变量。
+ * 找不到时退回调用方的模型并给出说明。
+ */
+export function resolveModel<M extends ModelLike>(spec: string | undefined, envModel: string | undefined, fallback: M, runtime: ModelSource<M>, inheritExplicit = false): { model: M; warning?: string } {
+	const wanted = spec && spec !== "inherit" ? spec : inheritExplicit ? undefined : envModel?.trim() || undefined;
+	if (!wanted || wanted === "inherit") return { model: fallback };
+	const slash = wanted.indexOf("/");
+	let found: M | undefined;
+	if (slash > 0) found = runtime.getModel(wanted.slice(0, slash), wanted.slice(slash + 1));
+	if (!found) {
+		const all = runtime.getModels();
+		const matches = all.filter((m) => m.id === wanted || m.name === wanted);
+		found = matches.find((m) => m.provider === fallback.provider) ?? matches[0];
+	}
+	if (found) return { model: found };
+	return { model: fallback, warning: `找不到模型「${wanted}」，subagent 改用 ${fallback.provider}/${fallback.id}` };
+}
+
+/** Claude Code 的 effort 映射到 pi 的 thinking level；max 映射到 pi 的最高档 xhigh，实际会按模型能力再截断。 */
+export function effortToThinking(effort: Effort | undefined): Exclude<Effort, "max"> | undefined {
+	if (!effort) return undefined;
+	return effort === "max" ? "xhigh" : effort;
+}
+
 /** 各作用域的定义来源。 */
 export interface AgentSources {
 	cwd: string;

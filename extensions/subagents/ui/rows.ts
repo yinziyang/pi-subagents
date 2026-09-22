@@ -7,7 +7,7 @@
 // 被隐藏的 agent 如果还有要显示的后代，照样显示，好让树的路径完整。
 
 import { type AgentRecord, MAIN_ID } from "../registry.ts";
-import { displayTokens, formatDuration, formatTokens } from "../report.ts";
+import { briefArgs, displayTokens, formatDuration, formatTokens, messageText } from "../report.ts";
 
 /** 失败或被停止的行在面板上保留的时间，与 Claude Code 一致。 */
 export const LINGER_MS = 30_000;
@@ -76,16 +76,16 @@ export function transcriptLines(entries: readonly { type: string; customType?: s
 	const out: TranscriptLine[] = [];
 	for (const e of entries) {
 		if (e.type === "custom_message" && e.customType === "pi-subagents-notification") {
-			out.push({ kind: "notice", text: `✉ ${firstLine(textOf(e.content))}` });
+			out.push({ kind: "notice", text: `✉ ${firstLine(messageText(e.content))}` });
 			continue;
 		}
 		const m = e.type === "message" ? e.message : undefined;
 		if (!m) continue;
 		if (m.role === "user") {
-			const t = textOf(m.content);
+			const t = messageText(m.content);
 			if (t) out.push({ kind: t.startsWith("[自动通知]") ? "notice" : "user", text: `› ${t}` });
 		} else if (m.role === "assistant") {
-			const t = textOf(m.content);
+			const t = messageText(m.content);
 			if (t) out.push({ kind: "assistant", text: t });
 			if (Array.isArray(m.content)) {
 				for (const b of m.content) if (b && typeof b === "object" && (b as { type?: string }).type === "toolCall") out.push({ kind: "tool", text: `⚙ ${(b as { name?: string }).name} ${briefArgs((b as { arguments?: unknown }).arguments)}`.trimEnd() });
@@ -93,7 +93,7 @@ export function transcriptLines(entries: readonly { type: string; customType?: s
 			if (m.stopReason === "error") out.push({ kind: "error", text: `✗ 模型服务错误：${m.errorMessage ?? "未知错误"}` });
 			if (m.stopReason === "aborted") out.push({ kind: "error", text: "■ 已中止" });
 		} else if (m.role === "toolResult") {
-			const t = firstLine(textOf(m.content));
+			const t = firstLine(messageText(m.content));
 			out.push({ kind: m.isError ? "error" : "result", text: `  ↳ ${m.isError ? "失败" : "完成"}${t ? `：${t}` : ""}` });
 		}
 	}
@@ -106,23 +106,7 @@ export function navigatorOrder(records: readonly AgentRecord[], dismissed: Reado
 	return [...visible.filter((r) => r.status === "running"), ...visible.filter((r) => r.status !== "running").sort((a, b) => b.startedAt - a.startedAt)];
 }
 
-function textOf(content: unknown): string {
-	if (typeof content === "string") return content.trim();
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((b) => (b && typeof b === "object" && (b as { type?: string }).type === "text" ? String((b as { text?: unknown }).text ?? "") : ""))
-		.join("")
-		.trim();
-}
-
 function firstLine(text: string, max = 120): string {
 	const line = text.split("\n").find((l) => l.trim()) ?? "";
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
-}
-
-function briefArgs(args: unknown): string {
-	if (!args || typeof args !== "object") return "";
-	const a = args as Record<string, unknown>;
-	const v = a.command ?? a.path ?? a.pattern ?? a.description ?? a.to ?? Object.values(a)[0];
-	return typeof v === "string" ? firstLine(v, 80) : "";
 }
