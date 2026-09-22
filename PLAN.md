@@ -581,7 +581,7 @@ pi-subagents/
 - 通过：单测 1 到 5（`test/definitions.test.ts`）。
 - 通过：E2E 6，临时项目里的 `reviewer` 与三个内置 agent 都被列出。
 - 通过：E2E 7，`--agents` 定义的 agent 被调用并原样返回标记。
-- 待做：TUI 8（启动诊断的显示）随 P6 一起验。
+- 通过：TUI 8，缺 description 的定义在启动时显示警告，写明路径与原因。
 
 ### P2（2026-09-22）
 
@@ -590,21 +590,22 @@ pi-subagents/
 - 通过：E2E 7 到 12（`isolation`、`systemPrompt`、`extensions`、`tools`、`usage`）。
   - 首轮发现内置 Explore、Plan 附加了项目 AGENTS.md，已在定义里补上 `omitClaudeMd: true`。
   - `omitClaudeMd` 的 agent 仍被注入常驻规范，已按 3.12 改 coding-standards：读到子会话标记后，`omitClaudeMd` 时不注入常驻规范；子会话里不送每轮提醒、不做收尾检查与决策留痕审计。
-- 待做：TUI 13 随 P6 一起验。
+- 通过：TUI 13，前台运行时卡片下方实时显示工具次数、token、耗时与当前命令，完成后折叠成一行统计。
 
 ### P3（2026-09-22）
 
 - 通过：单测 1、2（`test/registry.test.ts`、`test/background.test.ts`）。
 - 通过：集成 3 到 6（`test/background.test.ts`），并行时峰值并发实测为 3。
 - 通过：E2E 7、8（`printWait`、`depth`）。
-- 待做：RPC 9（并发上限）。
+- 通过：9 并发上限，改用集成测试验收（`test/background.test.ts`），结果确定且不花 token。
+  - 写这个用例时发现并修复一个竞态：检查并发上限与登记记录之间隔着一次 await，同一轮并行的调用会一起通过检查。
 
 ### P4（2026-09-22）
 
 - 通过：单测 1、2（`test/persistence.test.ts`、`test/registry.test.ts`）。
 - 通过：集成 3 到 6（`test/resume.test.ts`）。
 - 通过：E2E 7、8（`resumeAcrossRestart`）。
-- 待做：TUI 9 随 P6 一起验。
+- 通过：9 主会话压缩后续聊。真实会话太小，pi 拒绝压缩，改用集成测试调用 `compact()` 验收（`test/resume.test.ts`）。
 
 ### P5（2026-09-22）
 
@@ -615,4 +616,39 @@ pi-subagents/
   - 5 个并行 fork 都看到了主会话里的暗号。
   - fork 首次请求命中率：94.6%、94.6%、94.6%、94.6%、94.6%。
   - 主会话后续轮次命中率（基线）：93.1%、0.0%、95.6%、97.9%。
-- 待做：TUI 6 随 P6 一起验。
+- 通过：TUI 6，`/subtask` 立即返回，fork 出现在面板里，继承上下文，结果送回主会话。
+
+### P6（2026-09-22）
+
+TUI 验收在 tmux 里用真实 pi 完成，终端 170×48 与 100×40 两种尺寸。
+
+- 通过：1，面板第一行是 main，嵌套的缩进挂在父节点下并标出 `(+1)`，间隔截屏数字在变化。
+- 通过：2，`/agents` 与 `Ctrl+Alt+A` 都能打开导航（tmux 里 `Ctrl+Alt+A` 也可用），`↑` `↓` 与 `Esc` 正常。
+- 通过：3，记录视图显示任务、工具调用与结果、回复；在输入框发消息后，已完成的 agent 带着上下文恢复并回复。
+- 通过：4，`x` 停止运行中的 agent，显示为「已停止」，该行约 30 秒后消失；之后模型用 `send_message` 恢复它被拒绝。
+  - 首次验收发现并修复：工具执行期间被停止的 agent 被记成「失败」。原因是后台运行没有中止信号，`prompt()` 抛出的中止错误被当成模型出错。已补复现用例。
+  - 顺带修复：用户手动停止的 agent，报告里不再提示可以续聊。
+- 通过：5，成功完成的行立即移除，底栏出现「/agents 查看 subagent」。
+- 通过：6，100 列终端下按显示宽度测量最宽一行正好 100 列，中文按显示宽度截断并加省略号。
+- 通过：7 RPC（`test/e2e/rpc.mjs`），面板退化为一行状态，`/agents` 返回文字列表，agent 结束后状态清除。
+- 另外修复：界面回调抛出的异常会传进后台任务，把成功的 agent 标成失败。编排器现在吞掉界面与持久化回调的异常，已补复现用例。
+
+### P7（2026-09-22）
+
+- 通过：1，退出收尾时 3 个运行中的 subagent 在上限内全部关闭，重复收尾不报错（`test/lifecycle.test.ts`）。
+- 通过：2，有后台 agent 运行时 `/quit`，1 秒内退出，子 agent 里的 `sleep 300` 进程也被清理，没有残留。
+- 通过：3，`pi -p` 跑完包含子 agent 的任务后退出码为 0（`printWait`）。
+- 通过：4，`subagent:start` 与 `subagent:stop` 的次数、agent ID 与父子关系与实际一致（`test/lifecycle.test.ts`）。
+- 通过：5，收尾检查的反馈只出现在主会话结束时，子 agent 记录里没有（`stopChecksMainOnly`）。
+- 通过：6，`/goal` 进行中派出的子 agent 记录里没有任何 pi-goal 的消息或条目（`goalInertInChild`）。
+- 通过：7，README 写明用法、定义格式、字段表、环境变量、与 Claude Code 的全部差异、记录目录与清理方式。
+- 通过：8，`pi install ./packages/pi-subagents` 登记到 `~/.pi/agent/settings.json`。
+- 补充（用户要求）：skill 可用性。
+  - `skillsDiscovered`：general-purpose 与 Explore 的系统提示词里都列出了项目 skill，二者都主动读取了 skill 文件并答出其中的内容。
+  - `skillsPreloaded`：定义里写 `skills:` 时，skill 全文在系统提示词里，子 agent 没有调用工具就答对了。
+- 类型检查：`npm run typecheck` 通过，修复了一处 `finishTurn` 返回类型不匹配。
+
+### 全量回归（2026-09-22）
+
+- `npm test`：66 项全部通过。
+- `npm run e2e`：13 个真实 pi 场景与 RPC 场景全部通过；fork 首次请求命中率 93.2%，主会话基线 91.5% 到 97.5%。

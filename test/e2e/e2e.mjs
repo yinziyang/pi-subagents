@@ -234,6 +234,64 @@ const scenarios = {
 		check("至少 4 个 fork 的首次请求缓存命中率超过 80%", forkRatios.filter((x) => x > 0.8).length >= 4);
 		return cwd;
 	},
+
+	/** P7-5：coding-standards 的收尾检查只在主会话运行，子 agent 结束时不跑。 */
+	stopChecksMainOnly() {
+		const cwd = makeProject({ "go.mod": "module demo\n\ngo 1.22\n" });
+		runPi(cwd, "用 agent 工具派一个 general-purpose 子 agent（run_in_background 设为 false），任务原文「用 write 工具新建 main.go，内容恰好是三行：package main、空行、func main() { notDefined() }。只写入这个文件，不要编译、不要运行、不要修改。写完回复 written。」。它返回后，你这一轮只回复 ok，不要自己检查或修改文件；之后如果收到检查反馈，再按反馈修复。");
+		const r = inspect(cwd);
+		const child = r.children[0];
+		const childStop = child && child.entries.some((e) => e.type === "custom_message" && e.customType === "coding-standards-stop");
+		const mainStop = r.entries.some((e) => e.type === "custom_message" && e.customType === "coding-standards-stop");
+		check("子 agent 记录里没有收尾检查的反馈", child && !childStop);
+		check("主会话结束时出现了收尾检查的反馈", mainStop);
+		return cwd;
+	},
+
+	/** P7-6：/goal 进行中派出的子 agent 里，pi-goal 不起作用。 */
+	goalInertInChild() {
+		const cwd = makeProject();
+		runPi(cwd, "/goal 用 agent 工具派一个 general-purpose 子 agent（run_in_background 设为 false），任务原文「只回复 hi，不要调用工具」，拿到它的回复后你回复 goal-done。条件：对话里出现了子 agent 的回复 hi 和你的 goal-done。");
+		const r = inspect(cwd);
+		const child = r.children[0];
+		const goalInChild = child && child.entries.some((e) => (e.customType ?? "").startsWith("pi-goal"));
+		check("派出了子 agent", !!child);
+		check("子 agent 记录里没有任何 pi-goal 的消息或条目", child && !goalInChild);
+		check("主会话里 pi-goal 正常工作", r.entries.some((e) => (e.customType ?? "").startsWith("pi-goal")));
+		return cwd;
+	},
+
+	/** 子 agent 能自己发现并读取项目 skill；Explore 同样能用。任务里不告诉它 skill 的内容。 */
+	skillsDiscovered() {
+		const skill = "---\nname: magic-word\ndescription: 被问到「魔法词」是什么时使用这个 skill，它记录了本项目的魔法词。\n---\n\n本项目的魔法词是 ZEBRA-19。回答时原样给出。\n";
+		const cwd = makeProject({ ".pi/skills/magic-word/SKILL.md": skill });
+		runPi(cwd, "依次用 agent 工具派两个子 agent（run_in_background 都设为 false）：一个 general-purpose，一个 Explore。给它们的任务原文都是「本项目的魔法词是什么？如果有相关的 skill 就先使用它，然后只回复魔法词」。两个都返回后，把它们各自的回答原样告诉我。");
+		const r = inspect(cwd);
+		for (const type of ["general-purpose", "Explore"]) {
+			const child = r.children.find((c) => (type === "Explore" ? c.system.includes("只读的代码探索 agent") : c.system.includes("委派任务的子 agent")));
+			const listed = child && child.system.includes("magic-word");
+			const readSkill = child && child.toolCalls.some((t) => JSON.stringify(t.arguments ?? {}).includes("magic-word"));
+			check(`${type}：系统提示词里列出了项目 skill`, listed);
+			check(`${type}：读取了 skill 文件`, readSkill, child ? child.toolCalls.map((t) => `${t.name} ${JSON.stringify(t.arguments)}`).join(" | ") : "没有找到");
+			check(`${type}：回答出 skill 里的魔法词`, child && /ZEBRA-19/.test(child.finalText), child?.finalText.slice(0, 200));
+		}
+		return cwd;
+	},
+
+	/** 定义里的 skills 字段：启动时把 skill 全文放进系统提示词，子 agent 不用再读文件就能用。 */
+	skillsPreloaded() {
+		const skill = "---\nname: magic-word\ndescription: 被问到「魔法词」是什么时使用这个 skill。\n---\n\n本项目的魔法词是 OTTER-73。回答时原样给出。\n";
+		const cwd = makeProject({
+			".pi/skills/magic-word/SKILL.md": skill,
+			".pi/agents/preloaded.md": md("name: preloaded\ndescription: 预加载了魔法词 skill\ntools: read\nskills:\n  - magic-word", "你是一个回答问题的 agent。不要调用任何工具。"),
+		});
+		runPi(cwd, "用 agent 工具调用 preloaded（run_in_background 设为 false），任务原文「本项目的魔法词是什么？只回复魔法词」。返回后把它的回答原样告诉我。");
+		const r = inspect(cwd);
+		const child = r.children[0];
+		check("skill 全文在子 agent 的系统提示词里", child && child.system.includes("OTTER-73"));
+		check("子 agent 没有读文件就答出了魔法词", child && child.toolCalls.length === 0 && /OTTER-73/.test(child.finalText), child ? `${child.toolCalls.length} 次工具；${child.finalText.slice(0, 100)}` : "没有子 agent");
+		return cwd;
+	},
 };
 
 // ---------- 入口 ----------

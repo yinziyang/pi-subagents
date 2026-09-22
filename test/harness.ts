@@ -46,6 +46,8 @@ export interface HarnessOptions {
 	brokenUi?: boolean;
 	/** 合并进测试用 settings.json 的设置。 */
 	settings?: Record<string, unknown>;
+	/** 额外加载到主会话的扩展，例如订阅 pi.events 的监听器。 */
+	extraExtensions?: any[];
 }
 
 const systemOf = (messages: any[]) => {
@@ -89,7 +91,7 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	};
 	faux.setResponses(Array.from({ length: 500 }, () => step));
 
-	const loader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [subagents] });
+	const loader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [subagents, ...(opts.extraExtensions ?? [])] });
 	await loader.reload();
 	const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, resourceLoader: loader, sessionManager: SessionManager.create(cwd, join(agentDir, "sessions")) });
 	if (opts.ui) {

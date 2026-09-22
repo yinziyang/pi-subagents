@@ -180,8 +180,8 @@ function wrap(session: AgentSession, transcriptPath: string | undefined): ChildH
 	// 工具执行中被中止时 prompt() 会抛出普通错误，只看信号或消息的 stopReason 会把「被停止」误判成「失败」。
 	let abortRequested = false;
 	const previousFinishTurn = session.agent.finishTurn;
-	session.agent.finishTurn = async (turn, signal) => {
-		const decision = await previousFinishTurn?.(turn, signal);
+	session.agent.finishTurn = async (turn, signal): Promise<{ action: "continue" } | { action: "end" } | undefined> => {
+		const decision = (await previousFinishTurn?.(turn, signal)) ?? undefined;
 		turns++;
 		if (turnLimit !== undefined && turns >= turnLimit && turn.toolResults.length > 0 && decision?.action !== "end") {
 			hitMaxTurns = true;

@@ -7,7 +7,7 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { loadAgents } from "./definitions.ts";
 import { type NotificationDetails, Orchestrator } from "./orchestrator.ts";
 import { persistKey, RECORD_ENTRY, restoreRecords, toEntryData } from "./persistence.ts";
-import { AgentRegistry, limitsFromEnv, MAIN_ID } from "./registry.ts";
+import { AgentRegistry, type AgentRecord, limitsFromEnv, MAIN_ID } from "./registry.ts";
 import { parentRuntime } from "./runner.ts";
 import { registerSubagentTools } from "./tools.ts";
 import { AgentNavigator } from "./ui/navigator.ts";
@@ -33,6 +33,22 @@ const NOTIFY_BATCH_MS = 150;
 const HINT_MS = 30_000;
 
 const WIDGET_KEY = "pi-subagents";
+
+/** 广播给其他扩展的事件名，经 pi.events 发出。 */
+export const EVENT_START = "subagent:start";
+export const EVENT_STOP = "subagent:stop";
+
+/** subagent:start 与 subagent:stop 的载荷。 */
+export interface SubagentEvent {
+	agentId: string;
+	type: string;
+	name?: string;
+	/** 父 agent 的 ID，主会话为 "main"。 */
+	parentId: string;
+	status: AgentRecord["status"];
+	background: boolean;
+	fork: boolean;
+}
 
 export default function subagents(pi: ExtensionAPI) {
 	const env = process.env;
@@ -76,10 +92,19 @@ export default function subagents(pi: ExtensionAPI) {
 		}
 	};
 
-	/** 某个 agent 刚成功完成时，在底栏提示可以用 /agents 查看，30 秒后消失。 */
-	const hintOnComplete = (id: string, status: string) => {
-		const before = lastStatus.get(id);
-		lastStatus.set(id, status);
+	/**
+	 * 状态变化时的旁路动作：
+	 *   - 进入运行中（含续聊恢复）时广播 subagent:start，离开运行中时广播 subagent:stop，对应 Claude Code 的 SubagentStart、SubagentStop，供其他扩展订阅。
+	 *   - 刚成功完成时在底栏提示可以用 /agents 查看，30 秒后消失。
+	 */
+	const onTransition = (record: AgentRecord) => {
+		const before = lastStatus.get(record.id);
+		const status = record.status;
+		lastStatus.set(record.id, status);
+		if (before === status) return;
+		const payload: SubagentEvent = { agentId: record.id, type: record.type, name: record.name, parentId: record.parentId, status, background: record.background, fork: record.fork };
+		if (status === "running") pi.events.emit(EVENT_START, payload);
+		else if (before === "running") pi.events.emit(EVENT_STOP, payload);
 		const ctx = ctxRef;
 		if (before !== "running" || status !== "completed" || ctx?.mode !== "tui") return;
 		ctx.ui.setStatus(WIDGET_KEY, "/agents 查看 subagent");
@@ -129,7 +154,7 @@ export default function subagents(pi: ExtensionAPI) {
 			warn,
 			forkMode,
 			onRecordChange: (record) => {
-				hintOnComplete(record.id, record.status);
+				onTransition(record);
 				const key = persistKey(record);
 				if (persisted.get(record.id) === key) return;
 				persisted.set(record.id, key);

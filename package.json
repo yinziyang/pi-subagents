@@ -24,7 +24,9 @@
     ]
   },
   "scripts": {
-    "test": "node --test \"test/*.test.ts\""
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "npx -y -p typescript@5 tsc --noEmit --strict --target es2022 --module nodenext --moduleResolution nodenext --allowImportingTsExtensions --skipLibCheck extensions/subagents/*.ts extensions/subagents/ui/*.ts",
+    "e2e": "node test/e2e/e2e.mjs && node test/e2e/rpc.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
