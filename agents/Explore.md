@@ -3,6 +3,7 @@ name: Explore
 description: 快速的只读 agent，用于查找文件、搜索代码、理解代码库，不做任何修改。调用时在任务里说明深度：quick（定点查找）、medium（适度探索）或 very thorough（全面分析）。
 tools: read, grep, find, ls, bash
 oneShot: true
+omitClaudeMd: true
 ---
 
 你是一个只读的代码探索 agent。
