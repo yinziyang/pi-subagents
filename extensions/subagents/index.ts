@@ -1,14 +1,14 @@
 // pi-subagents：为 pi 提供与 Claude Code 语义一致的 subagent。
 // 本文件是组合根：装配编排器，注册工具、参数与事件，不承载编排规则。
 
-import { dirname, resolve, sep } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadAgents } from "./definitions.ts";
 import { type NotificationDetails, Orchestrator } from "./orchestrator.ts";
 import { persistKey, RECORD_ENTRY, restoreRecords, toEntryData } from "./persistence.ts";
 import { AgentRegistry, type AgentRecord, limitsFromEnv, MAIN_ID } from "./registry.ts";
-import { parentRuntime } from "./runner.ts";
+import { isSelfExtensionPath, parentRuntime } from "./runner.ts";
 import { registerSubagentTools } from "./tools.ts";
 import { AgentNavigator } from "./ui/navigator.ts";
 import { AgentPanel } from "./ui/panel.ts";
@@ -144,7 +144,7 @@ export default function subagents(pi: ExtensionAPI) {
 			env,
 			getRuntime: () => parentRuntime(ctx.modelRegistry),
 			mainSession: () => ({ id: ctx.sessionManager.getSessionId(), file: ctx.sessionManager.getSessionFile() }),
-			isSelfExtension: (p) => resolve(p).startsWith(EXT_DIR + sep),
+			isSelfExtension: (p) => isSelfExtensionPath(p, EXT_DIR),
 			childExtension: (agentId, canNest, isFork) => (childPi) => registerSubagentTools(childPi, o, { callerId: agentId, canNest, forkMode: forkMode(), isFork }),
 			notifyMain: (text, details) => {
 				if (o.isClosed()) return;

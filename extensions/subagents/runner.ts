@@ -7,8 +7,8 @@
 //   - AgentSession.dispose() 不会触发 session_shutdown，收尾时要自己先发出这个事件（有超时），再 dispose，否则子会话里扩展的资源会泄漏、websocket 会让进程无法退出。
 //   - close() 可以重复调用，只有第一次生效。
 
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -33,6 +33,54 @@ export interface ChildMarker {
 	/** 主会话的会话 ID。 */
 	parentSessionId: string;
 	agentId: string;
+}
+
+/** 本包的包名；另一份安装（例如用 -e 加载的开发副本）同样不能进子会话。 */
+const PACKAGE_NAME = "pi-subagents";
+
+/**
+ * 判断一个扩展是不是本包：解析符号链接后落在 selfDir 下，或者它所在的包名就是本包。
+ * 只比较路径字符串会漏掉经符号链接加载的情况（例如 macOS 上 /tmp 指向 /private/tmp），也会漏掉同时装着的另一份副本。
+ * 漏掉时子会话会再加载一份本包，它接管 agent 工具，嵌套深度从零算起，深度上限失效。
+ * 以 extensionFactories 注入的扩展路径是 `<inline:1>` 这样的占位名，不是文件，一律不算本包，否则会按当前目录去找 package.json。
+ */
+export function isSelfExtensionPath(extensionPath: string, selfDir: string): boolean {
+	if (!isAbsolute(extensionPath)) return false;
+	const real = realOrResolved(extensionPath);
+	if (real.startsWith(realOrResolved(selfDir) + sep)) return true;
+	return packageNameOf(real) === PACKAGE_NAME;
+}
+
+function realOrResolved(p: string): string {
+	try {
+		return realpathSync(p);
+	} catch {
+		return resolve(p);
+	}
+}
+
+/** 从扩展路径向上找最近的 package.json，返回其中的 name；找不到或读不了时返回 undefined。 */
+function packageNameOf(extensionPath: string): string | undefined {
+	let dir = isDirectory(extensionPath) ? extensionPath : dirname(extensionPath);
+	for (;;) {
+		try {
+			const name = (JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { name?: unknown }).name;
+			return typeof name === "string" ? name : undefined;
+		} catch {
+			// 这一级没有 package.json 或内容不是合法 JSON，继续向上找。
+		}
+		const parent = dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
+function isDirectory(p: string): boolean {
+	try {
+		return statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
 }
 
 /** 给 dispose 前的 session_shutdown 留的时间上限；超时后直接 dispose，不能让收尾挂住。 */
