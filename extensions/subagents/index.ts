@@ -10,6 +10,7 @@ import { persistKey, RECORD_ENTRY, restoreRecords, toEntryData } from "./persist
 import { AgentRegistry, type AgentRecord, limitsFromEnv, MAIN_ID } from "./registry.ts";
 import { isSelfExtensionPath, parentRuntime } from "./runner.ts";
 import { registerSubagentTools } from "./tools.ts";
+import { DialogQueue, forwardDialogs } from "./ui/forward.ts";
 import { AgentNavigator } from "./ui/navigator.ts";
 import { AgentPanel } from "./ui/panel.ts";
 import { isVisible, navigatorOrder, rowParts } from "./ui/rows.ts";
@@ -64,6 +65,17 @@ export default function subagents(pi: ExtensionAPI) {
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let hintTimer: ReturnType<typeof setTimeout> | undefined;
 	const lastStatus = new Map<string, string>();
+	/** 子 agent 转到主会话的对话框共用一个队列。 */
+	const dialogs = new DialogQueue();
+
+	/** 主会话当前可交互的 UI；没有界面，或会话已被替换、上下文失效时返回 undefined。 */
+	const mainUI = () => {
+		try {
+			return ctxRef?.hasUI ? ctxRef.ui : undefined;
+		} catch {
+			return undefined;
+		}
+	};
 
 	/** 有运行中或还在保留期的行时每秒刷新一次，好让耗时与保留期到点消失；没有时停下。 */
 	const ensureTicker = () => {
@@ -153,6 +165,8 @@ export default function subagents(pi: ExtensionAPI) {
 			},
 			warn,
 			forkMode,
+			childUI: (label, closed) => (mainUI() ? forwardDialogs(label, mainUI, dialogs, closed) : undefined),
+			isProjectTrusted: () => ctx.isProjectTrusted(),
 			onRecordChange: (record) => {
 				onTransition(record);
 				const key = persistKey(record);

@@ -16,6 +16,7 @@ import {
 	createAgentSession,
 	DefaultResourceLoader,
 	type ExtensionFactory,
+	type ExtensionUIContext,
 	ModelRuntime,
 	SessionManager,
 	type SessionEntry,
@@ -116,6 +117,11 @@ export interface ChildOptions {
 	isSelfExtension: (extensionPath: string) => boolean;
 	/** 注入子会话的内联扩展，例如 agent、send_message 工具。 */
 	extensionFactories: ExtensionFactory[];
+	/**
+	 * 子会话里扩展使用的 UI，通常把对话框转到主会话；不传或返回 undefined 时用 pi 的空 UI，扩展看到的 hasUI 为 false。
+	 * closed 在子会话关闭时触发，用来撤掉还没答复的对话框。
+	 */
+	uiContext?: (closed: AbortSignal) => ExtensionUIContext | undefined;
 	/** fork 时把请求的会话 ID 设成主会话的，提高服务端复用提示词缓存的概率。 */
 	routingSessionId?: string;
 	/** 测试用；默认读取 agentDir 下的用户设置。 */
@@ -187,18 +193,20 @@ export async function createChild(opts: ChildOptions): Promise<ChildHandle> {
 		sessionManager,
 		settingsManager: opts.settingsManager,
 	});
+	const closed = new AbortController();
 	try {
 		if (opts.source.kind !== "open") {
 			const marker: ChildMarker = { omitContextFiles: opts.omitContextFiles, parentSessionId: opts.parentSessionId, agentId: opts.agentId };
 			session.sessionManager.appendCustomEntry(CHILD_MARKER, marker);
 		}
-		await session.bindExtensions({ mode: "print" });
+		await session.bindExtensions({ mode: "print", uiContext: opts.uiContext?.(closed.signal) });
 	} catch (err) {
+		closed.abort();
 		session.dispose();
 		throw err;
 	}
 	if (opts.routingSessionId) (session.agent as { sessionId?: string }).sessionId = opts.routingSessionId;
-	return wrap(session, sessionManager.getSessionFile());
+	return wrap(session, sessionManager.getSessionFile(), closed);
 }
 
 function openSessionManager(opts: ChildOptions): SessionManager {
@@ -217,7 +225,7 @@ function openSessionManager(opts: ChildOptions): SessionManager {
 	return SessionManager.open(file);
 }
 
-function wrap(session: AgentSession, transcriptPath: string | undefined): ChildHandle {
+function wrap(session: AgentSession, transcriptPath: string | undefined, closed: AbortController): ChildHandle {
 	let closing: Promise<void> | undefined;
 	// 当前这次运行的轮数上限与计数；finishTurn 在每一轮结束、模型还想继续时判断是否到达上限。
 	let turnLimit: number | undefined;
@@ -282,6 +290,7 @@ function wrap(session: AgentSession, transcriptPath: string | undefined): ChildH
 		},
 		close() {
 			closing ??= (async () => {
+				closed.abort();
 				try {
 					await session.abort();
 				} catch {

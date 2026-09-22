@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { DESCRIPTION_TOKEN_WARN, loadAgents, parseAgentFile, parseCliAgents, projectAgentDirs, renderAgentRoster, resolveTools } from "../extensions/subagents/definitions.ts";
+import { DESCRIPTION_TOKEN_WARN, loadAgents, parseAgentFile, parseCliAgents, parseMcpServers, projectAgentDirs, renderAgentRoster, resolveTools } from "../extensions/subagents/definitions.ts";
 
 const BUILTIN_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "agents");
 const md = (fm: string, body = "正文") => `---\n${fm}\n---\n${body}\n`;
@@ -79,8 +79,31 @@ test("不支持的字段产生诊断，但 agent 照常加载", () => {
 	const r = parseAgentFile(md("name: h\ndescription: d\nhooks: {}\nmcpServers: [slack]\npermissionMode: plan"), "h.md", "user");
 	assert.ok(r.agent);
 	assert.equal(r.notes.length, 1);
-	assert.match(r.notes[0].message, /mcpServers、hooks 字段本期不支持/);
-	assert.doesNotMatch(r.notes[0].message, /permissionMode/, "permissionMode 静默忽略");
+	assert.match(r.notes[0].message, /hooks 字段本期不支持/);
+	assert.doesNotMatch(r.notes[0].message, /mcpServers|permissionMode/, "mcpServers 已支持，permissionMode 静默忽略");
+	assert.deepEqual(r.agent.mcpServers, { refs: ["slack"], inline: [] });
+});
+
+test("mcpServers 区分服务名引用与内联定义，YAML 与 --agents JSON 同一格式", () => {
+	const yaml = md("name: b\ndescription: d\nmcpServers:\n  - playwright:\n      type: stdio\n      command: npx\n      args: [\"-y\", \"@playwright/mcp@latest\"]\n  - github");
+	const r = parseAgentFile(yaml, "b.md", "user");
+	assert.deepEqual(r.notes, []);
+	assert.deepEqual(r.agent?.mcpServers, { refs: ["github"], inline: [{ name: "playwright", config: { type: "stdio", command: "npx", args: ["-y", "@playwright/mcp@latest"] } }] });
+	const cli = parseCliAgents(JSON.stringify({ w: { description: "d", prompt: "p", mcpServers: [{ docs: { url: "https://example.com/mcp" } }] } }));
+	assert.deepEqual(cli.agents[0].mcpServers?.inline, [{ name: "docs", config: { url: "https://example.com/mcp" } }]);
+});
+
+test("mcpServers 格式不对的条目逐条跳过并说明，其余照常生效", () => {
+	const r = parseMcpServers(["ok", "", { a: {}, b: {} }, { c: "x" }, { d: { args: [] } }, { e: { command: "e" } }, { e: { url: "u" } }, 3]);
+	assert.deepEqual(r.refs, ["ok"]);
+	assert.deepEqual(r.inline, [{ name: "e", config: { command: "e" } }]);
+	assert.equal(r.problems.length, 6);
+	assert.match(r.problems[3], /d.*缺少 command 或 url/);
+	assert.match(r.problems[4], /重名/);
+	assert.deepEqual(parseMcpServers({ slack: {} }).problems, ["必须是列表，已忽略"]);
+	const none = parseAgentFile(md("name: n\ndescription: d\nmcpServers: [\"\"]"), "n.md", "user");
+	assert.equal(none.agent?.mcpServers, undefined, "没有有效条目时不设字段");
+	assert.equal(none.notes.length, 1);
 });
 
 test("parseCliAgents 读 prompt 字段作系统提示词，JSON 错误整体报诊断", () => {

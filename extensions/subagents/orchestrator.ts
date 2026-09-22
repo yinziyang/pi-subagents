@@ -10,9 +10,10 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type AgentSessionEvent, type ExtensionFactory, loadSkills, type ModelRuntime, type SettingsManager, stripFrontmatter } from "@earendil-works/pi-coding-agent";
+import { type AgentSessionEvent, type ExtensionFactory, type ExtensionUIContext, loadSkills, type ModelRuntime, type SettingsManager, stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type AgentDefinition, effortToThinking, resolveModel, resolveTools } from "./definitions.ts";
 import { buildForkEntries, type ForkEntry, forkDirective } from "./fork.ts";
+import { inlineServersExtension, MCP_TOOL } from "./mcp.ts";
 import { AgentRegistry, type AgentRecord, MAIN_ID } from "./registry.ts";
 import { addUsage, apiErrorMessage, briefArgs, formatReport, messageText, oneLine, type RunOutcome, type UsageTotals } from "./report.ts";
 import { type ChildHandle, createChild, type RunResult } from "./runner.ts";
@@ -84,6 +85,13 @@ export interface OrchestratorDeps {
 	warn: (message: string) => void;
 	/** fork 模式是否开启。 */
 	forkMode: () => boolean;
+	/**
+	 * 子会话里扩展使用的 UI，通常把对话框转到主会话；返回 undefined 时子会话没有 UI。
+	 * label 标明是哪个 subagent，closed 在子会话关闭时触发。
+	 */
+	childUI?: (label: string, closed: AbortSignal) => ExtensionUIContext | undefined;
+	/** 项目是否已被信任；项目级定义里的内联 MCP 服务只在信任后注册，对齐 Claude Code。 */
+	isProjectTrusted?: () => boolean;
 	settingsManager?: SettingsManager;
 	/** 注册表变化时通知界面与持久化。 */
 	onRecordChange?: (record: AgentRecord) => void;
@@ -152,6 +160,7 @@ export class Orchestrator {
 		const available = unique([...caller.activeTools.filter((t) => !OWN_TOOLS.includes(t)), ...EXTRA_READ_TOOLS, ...(canNest ? [TOOL_AGENT] : []), TOOL_SEND, TOOL_STOP]);
 		const resolved = resolveTools(def, available);
 		if ("error" in resolved) return { text: `subagent「${def.name}」无法启动：${resolved.error}`, isError: true };
+		resolved.tools = this.withMcpTool(def, available, resolved.tools);
 		const { model, warning } = resolveModel(params.model ?? def.model, this.deps.env.PI_SUBAGENT_MODEL, caller.model, runtime, params.model === undefined && def.model === "inherit");
 		if (warning) this.deps.warn(warning);
 		const background = this.decideBackground(def, params);
@@ -189,7 +198,8 @@ export class Orchestrator {
 				parentSessionId: this.deps.mainSession().id,
 				parentSessionFile: this.deps.mainSession().file,
 				isSelfExtension: this.deps.isSelfExtension,
-				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth), false)],
+				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth), false), ...this.mcpExtensions(def, resolved.tools)],
+				uiContext: this.childUI(record),
 				settingsManager: this.deps.settingsManager,
 			});
 		} catch (err) {
@@ -252,6 +262,7 @@ export class Orchestrator {
 				parentSessionFile: this.deps.mainSession().file,
 				isSelfExtension: this.deps.isSelfExtension,
 				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth), true)],
+				uiContext: this.childUI(record),
 				routingSessionId: caller.sessionId,
 				settingsManager: this.deps.settingsManager,
 			});
@@ -297,7 +308,8 @@ export class Orchestrator {
 				source: { kind: "open", path: record.transcriptPath },
 				parentSessionId: this.deps.mainSession().id,
 				isSelfExtension: this.deps.isSelfExtension,
-				extensionFactories: [this.deps.childExtension(record.id, this.registry.canNest(record.depth), record.fork)],
+				extensionFactories: [this.deps.childExtension(record.id, this.registry.canNest(record.depth), record.fork), ...(def ? this.mcpExtensions(def, record.tools) : [])],
+				uiContext: this.childUI(record),
 				settingsManager: this.deps.settingsManager,
 			});
 		} catch (err) {
@@ -491,6 +503,39 @@ export class Orchestrator {
 			background: r.background,
 		});
 		return { text, usage: r.usage, agentId: r.id };
+	}
+
+	private childUI(record: AgentRecord): ((closed: AbortSignal) => ExtensionUIContext | undefined) | undefined {
+		const childUI = this.deps.childUI;
+		if (!childUI) return undefined;
+		const label = record.name ? `${record.type}（${record.name}）` : record.type;
+		return (closed) => childUI(label, closed);
+	}
+
+	/** 定义写了 mcpServers 时保证子 agent 拿到 mcp 工具，即使 tools 列表没写它；disallowedTools 显式移除时不加。 */
+	private withMcpTool(def: AgentDefinition, available: readonly string[], tools: string[]): string[] {
+		if (!def.mcpServers) return tools;
+		if (!available.includes(MCP_TOOL)) {
+			this.deps.warn(`subagent「${def.name}」定义了 mcpServers，但当前没有 ${MCP_TOOL} 工具（需要安装 pi-mcp-adapter），已忽略`);
+			return tools;
+		}
+		const removed = resolveTools({ tools: [MCP_TOOL], disallowedTools: def.disallowedTools }, [MCP_TOOL]);
+		if ("error" in removed || !removed.tools.length || tools.includes(MCP_TOOL)) return tools;
+		return [...tools, MCP_TOOL];
+	}
+
+	/**
+	 * 把定义里的内联 MCP 服务注册进子会话；子 agent 没有 mcp 工具时用不上，不注册。
+	 * 项目级定义要等项目被信任，对齐 Claude Code 的目录信任规则。
+	 */
+	private mcpExtensions(def: AgentDefinition, tools: readonly string[]): ExtensionFactory[] {
+		const inline = def.mcpServers?.inline ?? [];
+		if (!inline.length || !tools.includes(MCP_TOOL)) return [];
+		if (def.source === "project" && this.deps.isProjectTrusted?.() === false) {
+			this.deps.warn(`项目还没有被信任，subagent「${def.name}」的内联 MCP 服务 ${inline.map((s) => s.name).join("、")} 没有启动。信任项目后生效，非交互模式可加 --approve`);
+			return [];
+		}
+		return [inlineServersExtension(inline, this.deps.warn)];
 	}
 
 	private preloadSkills(def: AgentDefinition, cwd: string): string[] | undefined {

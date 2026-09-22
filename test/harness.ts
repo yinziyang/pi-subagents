@@ -48,6 +48,10 @@ export interface HarnessOptions {
 	settings?: Record<string, unknown>;
 	/** 额外加载到主会话的扩展，例如订阅 pi.events 的监听器。 */
 	extraExtensions?: any[];
+	/** 写进 agentDir/extensions/ 的扩展文件，键为文件名；主会话与子会话都会加载。 */
+	extensionFiles?: Record<string, string>;
+	/** ui 为 true 时主会话 ui.select 的实现，默认返回 undefined。 */
+	select?: (title: string, options: string[], opts?: any) => Promise<string | undefined>;
 }
 
 const systemOf = (messages: any[]) => {
@@ -65,6 +69,10 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	mkdirSync(agentDir, { recursive: true });
 	// 关掉自动重试，模型出错的用例才不会等退避。
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false }, ...opts.settings }));
+	for (const [file, content] of Object.entries(opts.extensionFiles ?? {})) {
+		mkdirSync(join(agentDir, "extensions"), { recursive: true });
+		writeFileSync(join(agentDir, "extensions", file), content);
+	}
 	for (const [file, content] of Object.entries(opts.agents ?? {})) {
 		mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
 		writeFileSync(join(cwd, ".pi", "agents", file), content);
@@ -101,6 +109,7 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 		const uiContext: any = { notify: (m: string) => opts.notes?.push(m) };
 		for (const k of ["setStatus", "setWidget", "setWorkingMessage", "setWorkingVisible", "setWorkingIndicator", "setHiddenThinkingLabel", "setFooter", "setHeader", "setTitle", "pasteToEditor", "setEditorText", "addAutocompleteProvider", "setEditorComponent", "setToolsExpanded", "onTerminalInput"]) uiContext[k] = noop;
 		for (const k of ["select", "input", "editor", "custom"]) uiContext[k] = async () => undefined;
+		if (opts.select) uiContext.select = opts.select;
 		uiContext.confirm = async () => false;
 		uiContext.getEditorText = () => "";
 		if (opts.brokenUi) uiContext.setStatus = () => {

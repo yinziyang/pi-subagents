@@ -27,7 +27,7 @@
 ### 本期不做
 
 - 权限模式（`permissionMode`）、权限规则、auto 分类器：后续单独做权限包，届时 subagent 接入。
-- MCP 与 `mcpServers` 字段：pi 没有 MCP，后续单独做。
+- MCP 与 `mcpServers` 字段：pi 没有 MCP，后续单独做。已在第 8 节完成，MCP 本身由 pi-mcp-adapter 提供。
 - `isolation: worktree`：放第二期。
 - `memory` 字段：放第二期。
 - `--agent` 让整个主会话以某个 agent 身份运行，以及 `initialPrompt` 字段：放第二期。
@@ -95,7 +95,8 @@
 | `effort` | 支持 | 映射到 pi 的 thinking level；`xhigh`、`max` 映射到模型支持的最高档 |
 | `color` | 支持 | 面板与记录里的颜色，取值同 Claude Code |
 | `permissionMode` | 忽略 | 权限包实现后接入；本期读到时不报错 |
-| `mcpServers`、`hooks`、`memory`、`isolation`、`initialPrompt`、`experimental` | 忽略 | 读到时记一条诊断，说明本期不支持 |
+| `mcpServers` | 支持 | 见第 8 节 |
+| `hooks`、`memory`、`isolation`、`initialPrompt`、`experimental` | 忽略 | 读到时记一条诊断，说明本期不支持 |
 
 ### 3.2 内置 agent
 
@@ -368,7 +369,7 @@ pi-subagents/
    - `--agents` 胜过项目，项目胜过用户，用户胜过内置。
    - 嵌套项目目录里，离 cwd 近的胜出。
    - 同名覆盖内置 `Explore` 后，使用覆盖者的 `model`。
-4. 【单测】不支持的字段（`hooks`、`mcpServers` 等）产生诊断，但 agent 照常加载。
+4. 【单测】不支持的字段（`hooks` 等）产生诊断，但 agent 照常加载。
 5. 【单测】description 合计超过阈值时产生警告，全部 agent 仍然加载。
 6. 【E2E】在临时项目里放 `.pi/agents/reviewer.md`，运行 `pi -p "列出你能调用的 subagent 类型，只列名字"`：输出包含 `reviewer`、`general-purpose`、`Explore`、`Plan`。
 7. 【E2E】`pi -p --agents '{"tmp-agent":{"description":"测试","prompt":"只回复 TMP"}}' "用 tmp-agent 执行任意任务，原样返回它的回复"`：最终输出含 `TMP`。
@@ -537,12 +538,56 @@ pi-subagents/
 ## 7. 第二期
 
 - `isolation: worktree`：`git worktree add`，子 agent 的 cwd 指向工作树，没有改动时自动清理。
-- 接入权限包：`permissionMode`、后台权限请求转到主会话（机制已实测可行）、按 Claude Code 规则继承。
+- 接入权限包：`permissionMode`、按 Claude Code 规则继承。后台确认请求转到主会话已在第 8 节完成。
 - `memory` 字段。
 - `--agent` 与 `initialPrompt`。
 - 输入 `@agent-<名字>` 时的补全与强制委派。
 - 输入框为空时按 `↓` 进入面板（要包一层编辑器，需要评估与其他扩展的冲突）。
 - 需要强隔离的 agent 改用子进程运行。
+
+## 8. MCP 接入
+
+MCP 本身不自己实现，直接使用社区最成熟的 pi-mcp-adapter（2.36.0）。
+本包只补 subagent 这一侧与 Claude Code 的差距，两个包之间没有代码依赖，只经 `pi.events` 上的公开事件对接。
+
+### 8.1 现状（接入前实测）
+
+- 子 agent 加载主会话同样的扩展，所以已经继承主会话的全部 MCP 服务，可以用 `mcp` 工具调用。
+- 每个子 agent 各自启动服务进程，子 agent 结束时进程随即退出，没有泄漏。
+- 差距一：子 agent 绑定的是空 UI，`approveTools` 要求确认的工具在子 agent 里一律失败，报「需要交互式会话」。
+- 差距二：定义里的 `mcpServers` 字段被忽略。
+
+### 8.2 设计
+
+- 确认框转发：子会话绑定一个只转发对话框的 UI。
+  - `select`、`confirm`、`input`、`editor` 转到主会话，标题前加 `[subagent 类型（名字）]`。
+  - 其余界面操作一律不做，子 agent 不能改主会话的界面。
+  - 所有子 agent 共用一个队列，主会话上一次只显示一个转发来的对话框。
+  - 子会话关闭时撤掉它正在显示与排队中的对话框，按取消处理。
+  - 主会话没有界面（`-p`）时子会话也不绑定界面，需要确认的操作照旧按拒绝处理。
+  - 不用适配器的审批事件：适配器对每一次调用都先问这个事件，接管方不知道该工具是否需要确认，接管后会让所有调用都弹框。
+- `mcpServers`：
+  - 字符串条目引用已配置的服务。子 agent 本来就继承全部服务，引用只起声明作用。
+  - 对象条目是内联定义，子会话 `session_start` 时经 `pi-mcp-adapter:runtime-register:v1` 注册给子会话自己的适配器实例，主会话看不到，子会话关闭时随之断开。
+  - 定义写了 `mcpServers` 时自动给子 agent 加上 `mcp` 工具，`disallowedTools` 显式移除时不加。
+  - 项目级定义里的内联服务要等项目被信任才注册，对齐 Claude Code 的目录信任规则。
+  - 信任沿用 pi 的判定，只有 `.pi/agents/` 的项目在 pi 看来不需要信任，这点比 Claude Code 宽松，README 写明。
+  - 没装适配器、内联服务与已配置的服务重名时给出提示，子 agent 照常启动。
+- 放弃的做法：校验引用的服务名是否存在。
+  - 适配器有元数据缓存时，要到第一次 MCP 调用才初始化，状态快照通常晚于 subagent 启动才到。
+  - 校验时有时无比不校验更容易误导，所以不做；名字写错时，模型的调用会收到「服务不存在」的错误。
+
+### 8.3 验收标准
+
+1. 定义解析：YAML 与 `--agents` JSON 同一格式；格式不对的条目逐条跳过并说明，其余照常生效。
+2. 内联服务只注册进子 agent，主会话的 `mcp` 看不到；`tools` 没写 `mcp` 时子 agent 仍能调用。
+3. 内联服务与已配置的服务重名、没有 `mcp` 工具时给出提示，子 agent 照常完成。
+4. 子 agent 里扩展弹出的确认框显示在主会话、标明来源，答复回到子 agent；`-p` 时按拒绝处理。
+5. 多个确认请求排队；子会话关闭时撤掉它的对话框；主会话界面出错时按取消处理，不阻塞后续请求。
+6. 真实 pi 与真实适配器：内联服务进程由子 agent 启动、随子 agent 退出；主会话看不到它；进程无残留。
+7. 真实 pi：项目未被信任时不启动项目级定义的内联服务并给出提示，`--approve` 后启动。
+8. 真实 TUI：后台子 agent 调用 `approveTools` 里的工具时主会话弹出确认框；允许、拒绝、两个并行请求依次显示都符合预期；`/quit` 后无残留进程。
+9. 已有的单元、集成、E2E、RPC 场景全部回归通过。
 
 ## 附录：社区实现对照
 
@@ -655,3 +700,25 @@ TUI 验收在 tmux 里用真实 pi 完成，终端 170×48 与 100×40 两种尺
 - 重构后再跑一次全量：`forkCache` 这一轮未通过，其余全部通过。
   - 单独重跑两次都通过，fork 首次请求命中率均为 94.7%；主会话自己的基线里同样偶尔出现 0%。
   - 结论：缓存命中由服务端尽力而为，这一项会偶发失败，失败时应重跑确认，不代表 fork 的前缀出了问题。前缀逐字节一致由集成测试 `test/fork-session.test.ts` 确定性地保证。
+
+### MCP 接入（2026-09-22）
+
+被测环境：pi 0.87.0，pi-mcp-adapter 2.36.0，测试用 MCP 服务 `test/e2e/mcp-probe-server.mjs`（启动与退出时写日志，用来核对进程）。
+
+- 通过：1，`test/definitions.test.ts` 两项，覆盖 YAML、`--agents` JSON 与七种格式错误。
+- 通过：2、3，`test/mcp.test.ts`，用模拟适配器驱动真实的子会话。
+- 通过：4，`test/mcp.test.ts`，交互模式转发并带回答复，`-p` 时子 agent 的 `hasUI` 为 false。
+- 通过：5，`test/forward.test.ts` 三项。
+- 通过：6，E2E 场景 `mcpInline`：子 agent 调到了内联服务与继承的服务，主会话的 `mcp({})` 里没有内联服务，所有服务进程都已退出。
+- 通过：7，项目里有 `.pi/settings.json` 时，不加 `--approve` 提示「项目还没有被信任」且内联服务没有启动，加 `--approve` 后启动。
+- 通过：8，tmux 里的真实 TUI，`approveTools: ["echo"]`：
+  - 后台 general-purpose 调用 `echo` 时，主会话弹出 `[subagent general-purpose] MCP: probe wants to run echo`，四个选项与主会话自己调用时相同。
+  - 选 Allow once，子 agent 拿到 `probe#43038 echo: from-child`。
+  - 按 Esc 拒绝，子 agent 报告 `The user declined approval to run MCP tool "echo" on server "probe".`。
+  - 并行派出 a1、a2，两个请求依次显示，标题分别带 `（a1）`、`（a2）`，两个都拿到结果。
+  - `/quit` 后 4 个服务进程全部退出。
+- 通过：9，`npm test` 77 项；`npm run e2e` 14 个场景与 RPC 场景全部通过，fork 首次请求命中率 92.7%（五个里一个为 0%，与之前记录的服务端偶发未命中一致）。
+- 过程中发现并修复：
+  - 引用校验不可靠，已放弃，原因见 8.2。
+  - 子会话识别本包只比较路径字符串。经符号链接加载（macOS 的 `/tmp` 指向 `/private/tmp`），或同时装着另一份副本时，子会话会再加载一份本包，接管 `agent` 工具，深度上限失效，`depth` 场景因此失败。改为解析符号链接后比较，并把包名为 `pi-subagents` 的扩展都认作本包；`test/self-extension.test.ts` 覆盖。
+  - 没装适配器时同一个定义会提示两次，改为子 agent 没有 `mcp` 工具时不再尝试注册内联服务。

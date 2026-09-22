@@ -32,12 +32,30 @@ export interface AgentDefinition {
 	omitContextFiles?: boolean;
 	/** Claude Code 的 effort 取值，启动时映射到 pi 的 thinking level。 */
 	effort?: Effort;
+	/** 定义里的 mcpServers，由 pi-mcp-adapter 提供实际的 MCP 连接。 */
+	mcpServers?: AgentMcpServers;
 	color?: AgentColor;
 	/** 一次性 agent 不返回可续聊的 ID，只有内置的 Explore、Plan 是一次性的。 */
 	oneShot: boolean;
 	source: AgentSource;
 	/** 定义所在文件；来自 --agents 参数的没有文件。 */
 	filePath?: string;
+}
+
+/**
+ * mcpServers 字段拆开后的两类条目，语义对齐 Claude Code：
+ *   - refs：引用主会话已配置的服务名。子 agent 本来就继承主会话的全部服务，引用只起声明作用，不校验名字是否存在。
+ *   - inline：只给这个子 agent 用的内联定义，子 agent 启动时注册、结束时随子会话断开，主会话看不到。
+ */
+export interface AgentMcpServers {
+	refs: string[];
+	inline: InlineMcpServer[];
+}
+
+/** 一个内联 MCP 服务：config 与 .mcp.json 里的服务条目同一格式，原样交给 pi-mcp-adapter。 */
+export interface InlineMcpServer {
+	name: string;
+	config: Record<string, unknown>;
 }
 
 export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
@@ -53,7 +71,7 @@ const EFFORTS: readonly Effort[] = ["low", "medium", "high", "xhigh", "max"];
 const COLORS: readonly AgentColor[] = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"];
 
 /** Claude Code 支持、本期不支持的字段；读到时记诊断，定义照常加载。 */
-const UNSUPPORTED_FIELDS = ["mcpServers", "hooks", "memory", "isolation", "initialPrompt", "experimental"];
+const UNSUPPORTED_FIELDS = ["hooks", "memory", "isolation", "initialPrompt", "experimental"];
 
 /**
  * 所有 agent 的 description 合计超过这个估算 token 数时给出警告，与 Claude Code 的阈值一致。
@@ -153,6 +171,11 @@ function buildDefinition(fm: Record<string, unknown>, body: string, source: Agen
 		if (COLORS.includes(fm.color as AgentColor)) agent.color = fm.color as AgentColor;
 		else notes.push({ path: where, message: `agent「${name}」的 color 取值不对，应为 ${COLORS.join("、")}，已忽略` });
 	}
+	if (fm.mcpServers !== undefined) {
+		const mcp = parseMcpServers(fm.mcpServers);
+		for (const problem of mcp.problems) notes.push({ path: where, message: `agent「${name}」的 mcpServers ${problem}` });
+		if (mcp.refs.length || mcp.inline.length) agent.mcpServers = { refs: mcp.refs, inline: mcp.inline };
+	}
 	// 一次性标记只对内置定义生效，用户定义与 Claude Code 一样总是可续聊。
 	if (source === "builtin" && fm.oneShot === true) agent.oneShot = true;
 	const unsupported = UNSUPPORTED_FIELDS.filter((f) => fm[f] !== undefined);
@@ -166,6 +189,38 @@ function parseToolList(value: unknown): string[] | undefined | "invalid" {
 	if (typeof value === "string") return splitList(value);
 	if (Array.isArray(value) && value.every((v) => typeof v === "string")) return value.map((v) => v.trim()).filter(Boolean);
 	return "invalid";
+}
+
+/**
+ * 解析 mcpServers：必须是列表，每一项是服务名字符串，或者只有一个键的对象（键是服务名，值是服务配置）。
+ * 格式不对的条目逐条跳过并说明原因，其余条目照常生效。
+ */
+export function parseMcpServers(value: unknown): AgentMcpServers & { problems: string[] } {
+	const out: AgentMcpServers & { problems: string[] } = { refs: [], inline: [], problems: [] };
+	if (!Array.isArray(value)) {
+		out.problems.push("必须是列表，已忽略");
+		return out;
+	}
+	for (const [i, entry] of value.entries()) {
+		const at = `第 ${i + 1} 项`;
+		if (typeof entry === "string") {
+			if (entry.trim()) out.refs.push(entry.trim());
+			else out.problems.push(`${at}是空字符串，已跳过`);
+			continue;
+		}
+		const keys = isRecord(entry) ? Object.keys(entry) : [];
+		if (keys.length !== 1) {
+			out.problems.push(`${at}应为服务名，或只有一个键的「服务名: 配置」，已跳过`);
+			continue;
+		}
+		const name = keys[0].trim();
+		const config = (entry as Record<string, unknown>)[keys[0]];
+		if (!name || !isRecord(config)) out.problems.push(`${at}的服务配置必须是对象，已跳过`);
+		else if (typeof config.command !== "string" && typeof config.url !== "string") out.problems.push(`${at}（${name}）缺少 command 或 url，已跳过`);
+		else if (out.inline.some((s) => s.name === name)) out.problems.push(`${at}（${name}）与前面的内联服务重名，已跳过`);
+		else out.inline.push({ name, config });
+	}
+	return out;
 }
 
 /** 按顶层逗号切分，括号里的逗号不切，例如 `Agent(worker, researcher), Read`。 */
