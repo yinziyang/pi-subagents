@@ -38,6 +38,10 @@ export interface HarnessOptions {
 	env?: Record<string, string>;
 	/** 写进 cwd/.pi/agents/ 的定义文件，键为文件名。 */
 	agents?: Record<string, string>;
+	/** 为 true 时模拟交互模式：ctx.hasUI 为真，界面调用全部是空操作。 */
+	ui?: boolean;
+	/** 记录 ui.notify 的内容。 */
+	notes?: string[];
 }
 
 const systemOf = (messages: any[]) => {
@@ -84,7 +88,13 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	const loader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [subagents] });
 	await loader.reload();
 	const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, resourceLoader: loader, sessionManager: SessionManager.create(cwd, join(agentDir, "sessions")) });
-	await session.bindExtensions({ mode: "print" });
+	if (opts.ui) {
+		// 用 Proxy 提供一个什么也不做的界面，只记录 notify，足够让扩展走交互模式的分支。
+		const uiContext = new Proxy({} as any, { get: (_t, prop) => (prop === "notify" ? (m: string) => opts.notes?.push(m) : () => undefined) });
+		await session.bindExtensions({ mode: "tui", uiContext });
+	} else {
+		await session.bindExtensions({ mode: "print" });
+	}
 
 	return {
 		dir,
@@ -118,3 +128,15 @@ export const call = (name: string, args: Record<string, unknown>) => fauxAssista
 /** 最后一条消息是不是某个工具的结果。 */
 export const lastToolResult = (req: Request) => (req.last?.role === "toolResult" ? req.last : undefined);
 export const resultText = (m: any) => textOf(m);
+
+/** 轮询直到条件成立，超时抛错。 */
+export async function waitFor(check: () => boolean, ms = 5_000, what = "条件"): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (!check()) {
+		if (Date.now() > deadline) throw new Error(`等待${what}超时`);
+		await new Promise((r) => setTimeout(r, 10));
+	}
+}
+
+/** 主会话里的 subagent 通知消息。 */
+export const notifications = (session: any) => (session.messages as any[]).filter((m) => m.role === "custom" && m.customType === "pi-subagents-notification");

@@ -1,11 +1,11 @@
 // pi-subagents：为 pi 提供与 Claude Code 语义一致的 subagent。
 // 本文件是组合根：装配编排器，注册工具、参数与事件，不承载编排规则。
 
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadAgents } from "./definitions.ts";
-import { Orchestrator } from "./orchestrator.ts";
+import { type NotificationDetails, Orchestrator } from "./orchestrator.ts";
 import { AgentRegistry, limitsFromEnv, MAIN_ID } from "./registry.ts";
 import { parentRuntime } from "./runner.ts";
 import { registerSubagentTools } from "./tools.ts";
@@ -22,10 +22,26 @@ export const NOTIFY_TYPE = "pi-subagents-notification";
  */
 const DEFAULT_PRINT_WAIT_MS = 30 * 60_000;
 
+/** 同一时刻完成的多个 subagent 的通知在这段时间内合并成一条，避免一次触发多轮。 */
+const NOTIFY_BATCH_MS = 150;
+
 export default function subagents(pi: ExtensionAPI) {
 	const env = process.env;
 	let ctxRef: ExtensionContext | undefined;
 	let orch: Orchestrator | undefined;
+	let pending: Array<{ text: string; details: NotificationDetails }> = [];
+	let flushTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/** 把缓冲的通知作为一条消息送进主会话：空闲时立即开始新一轮，运行中时排到本轮结束后。 */
+	const flushNotifications = () => {
+		clearTimeout(flushTimer);
+		flushTimer = undefined;
+		const batch = pending.splice(0);
+		if (!batch.length) return;
+		const content = batch.map((b) => b.text).join("\n\n---\n\n");
+		const details: NotificationDetails = { agents: batch.flatMap((b) => b.details.agents) };
+		pi.sendMessage({ customType: NOTIFY_TYPE, content, display: true, details }, { deliverAs: "followUp", triggerTurn: true });
+	};
 
 	pi.registerFlag("agents", { description: "以 JSON 定义只在本次会话有效的 subagent，格式同 Claude Code 的 --agents", type: "string" });
 
@@ -51,7 +67,8 @@ export default function subagents(pi: ExtensionAPI) {
 			childExtension: (agentId, canNest) => (childPi) => registerSubagentTools(childPi, o, { callerId: agentId, canNest, forkMode: forkMode() }),
 			notifyMain: (text, details) => {
 				if (o.isClosed()) return;
-				pi.sendMessage({ customType: NOTIFY_TYPE, content: text, display: true, details }, { deliverAs: "followUp", triggerTurn: true });
+				pending.push({ text, details });
+				flushTimer ??= setTimeout(flushNotifications, NOTIFY_BATCH_MS);
 			},
 			warn,
 			forkMode,
@@ -74,13 +91,20 @@ export default function subagents(pi: ExtensionAPI) {
 
 	// -p 模式在 agent_settled 之后就拆掉会话，所以要在 agent_end 里等主会话的后台 subagent 结束，结果才不会丢。
 	pi.on("agent_end", async (_event, ctx) => {
-		if (ctx.hasUI || !orch?.hasRunningForMain()) return;
-		const wait = Number(env.PI_SUBAGENT_PRINT_WAIT_MS);
-		const done = await orch.waitForMainTasks(Number.isFinite(wait) && wait > 0 ? wait : DEFAULT_PRINT_WAIT_MS);
-		if (!done) warn("等待后台 subagent 超时，剩余的已被中止");
+		if (ctx.hasUI || !orch) return;
+		if (orch.hasRunningForMain()) {
+			const wait = Number(env.PI_SUBAGENT_PRINT_WAIT_MS);
+			const done = await orch.waitForMainTasks(Number.isFinite(wait) && wait > 0 ? wait : DEFAULT_PRINT_WAIT_MS);
+			if (!done) warn("等待后台 subagent 超时，剩余的已被中止");
+		}
+		// 必须在 agent_end 里当场送出，等定时器触发时 -p 的会话可能已经拆掉了。
+		flushNotifications();
 	});
 
 	pi.on("session_shutdown", async () => {
+		clearTimeout(flushTimer);
+		flushTimer = undefined;
+		pending = [];
 		await orch?.shutdown();
 	});
 }
