@@ -98,7 +98,8 @@ test("task_stop：停止运行中的 agent，已有输出保留；之后模型�
 			if (isGeneralPurpose(req)) {
 				if (JSON.stringify(req.messages).includes("继续吧")) return text("继续完成");
 				await new Promise<void>((r) => req.signal?.addEventListener("abort", () => r(), { once: true }));
-				return fauxAssistantMessage([], { stopReason: "aborted", errorMessage: "aborted" });
+				// 真实 provider 被中止时报的是 error，不是 aborted。
+				return fauxAssistantMessage([], { stopReason: "error", errorMessage: "This operation was aborted" });
 			}
 			if (isNote(req.last)) return text("收到通知");
 			const tr = lastToolResult(req);
@@ -119,6 +120,33 @@ test("task_stop：停止运行中的 agent，已有输出保留；之后模型�
 		assert.match(resultText(toolResults(h, "send_message")[0]), /已在后台恢复运行/);
 		await waitFor(() => notifications(h.session).length === 2, 5_000, "恢复后的通知");
 		assert.match(resultText(notifications(h.session)[1]), /继续完成/);
+		await h.session.agent.waitForIdle();
+	} finally {
+		await h.close();
+	}
+});
+
+test("工具执行期间被停止：状态是 stopped 而不是 failed", async () => {
+	const h = await makeHarness({
+		ui: true,
+		route: async (req) => {
+			if (isGeneralPurpose(req)) return lastToolResult(req) ? text("不该走到这里") : call("bash", { command: "sleep 30" });
+			if (isNote(req.last)) return text("收到");
+			const tr = lastToolResult(req);
+			if (tr?.toolName === "agent") {
+				// 等子 agent 进入 bash 执行后再停止它。
+				await new Promise((r) => setTimeout(r, 500));
+				return call("task_stop", { to: "sleeper" });
+			}
+			if (tr) return text("好");
+			return call("agent", { description: "睡觉", prompt: "睡一会", name: "sleeper" });
+		},
+	});
+	try {
+		await h.prompt("开始");
+		await waitFor(() => notifications(h.session).length === 1, 10_000, "停止后的通知");
+		assert.equal(notifications(h.session)[0].details.agents[0].status, "stopped");
+		assert.match(resultText(notifications(h.session)[0]), /子 agent 被中止/);
 		await h.session.agent.waitForIdle();
 	} finally {
 		await h.close();

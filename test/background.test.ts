@@ -191,3 +191,25 @@ test("前后台的选择：禁用后台的环境变量、定义里的 background
 		await h3.close();
 	}
 });
+
+test("界面回调抛异常不影响 agent：后台 agent 仍然报告为成功完成", async () => {
+	const h = await makeHarness({
+		ui: true,
+		brokenUi: true,
+		route: (req) => {
+			if (isGeneralPurpose(req)) return text("fine-report");
+			if (isNotification(req.last)) return text("收到");
+			if (lastToolResult(req)) return text("已派出");
+			return bg("任务");
+		},
+	});
+	try {
+		await h.prompt("开始");
+		await waitFor(() => notifications(h.session).length === 1, 5_000, "通知");
+		assert.match(resultText(notifications(h.session)[0]), /fine-report/);
+		assert.equal(notifications(h.session)[0].details.agents[0].status, "completed");
+		await h.session.agent.waitForIdle();
+	} finally {
+		await h.close();
+	}
+});

@@ -2,12 +2,15 @@
 // 主会话与每个子会话都注册同一套工具，区别只在调用方 ID；子会话里的工具通过闭包共享主进程里的编排器与注册表。
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { renderAgentRoster } from "./definitions.ts";
 import type { ForkEntry } from "./fork.ts";
 import { type Caller, type Orchestrator, TOOL_AGENT, TOOL_SEND, TOOL_STOP, type ToolReply } from "./orchestrator.ts";
 import type { AgentRecord } from "./registry.ts";
 import { displayTokens, formatDuration, formatTokens } from "./report.ts";
+import { statusColor } from "./ui/panel.ts";
+import { rowParts } from "./ui/rows.ts";
 
 export interface ToolOptions {
 	/** 调用方 ID：主会话为 MAIN_ID，子会话为它自己的 agent ID。 */
@@ -44,6 +47,22 @@ export function registerSubagentTools(pi: ExtensionAPI, orch: Orchestrator, opts
 			promptSnippet: "Delegate a task to a subagent with its own isolated context",
 			parameters: agentParameters(opts.forkMode),
 			executionMode: "parallel",
+			renderCall(args, theme) {
+				const a = args as { subagent_type?: string; name?: string; description?: string };
+				return new Text(`${theme.fg("toolTitle", theme.bold("Agent"))} ${theme.fg("accent", a.subagent_type || "general-purpose")}${a.name ? theme.fg("muted", `（${a.name}）`) : ""} ${theme.fg("dim", a.description ?? "")}`, 0, 0);
+			},
+			// 运行中显示实时进度；完成后默认折叠成一行统计，展开（Ctrl+O）才显示完整报告。
+			renderResult(result, options, theme, context) {
+				const body = result.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+				if (options.isPartial) return new Text(theme.fg("muted", body), 0, 0);
+				if ((context as { isError?: boolean }).isError) return new Text(theme.fg("error", body), 0, 0);
+				const id = (result.details as { agentId?: string } | undefined)?.agentId;
+				const r = id ? orch.registry.get(id) : undefined;
+				if (options.expanded || !r) return new Text(theme.fg("toolOutput", body), 0, 0);
+				if (r.background && r.status === "running") return new Text(theme.fg("muted", `后台运行中 · agent ID ${r.id} · 完成后结果以通知送回`), 0, 0);
+				const p = rowParts(r, Date.now());
+				return new Text(`${theme.fg(statusColor(r), p.icon)} ${theme.fg("muted", `${p.status} · ${p.stats}`)} ${theme.fg("dim", "（Ctrl+O 展开报告）")}`, 0, 0);
+			},
 			async execute(toolCallId, params, signal, onUpdate, ctx) {
 				if (opts.isFork && !opts.canNest) return toResult({ text: "已到达 subagent 的嵌套深度上限，不能再派出 subagent。请自己完成这项工作。", isError: true });
 				if (opts.isFork && params.subagent_type === "fork") return toResult({ text: "fork 不能再派生 fork。需要委派时请改用具体的 subagent 类型。", isError: true });

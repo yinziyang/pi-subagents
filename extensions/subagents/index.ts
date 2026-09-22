@@ -10,6 +10,9 @@ import { persistKey, RECORD_ENTRY, restoreRecords, toEntryData } from "./persist
 import { AgentRegistry, limitsFromEnv, MAIN_ID } from "./registry.ts";
 import { parentRuntime } from "./runner.ts";
 import { registerSubagentTools } from "./tools.ts";
+import { AgentNavigator } from "./ui/navigator.ts";
+import { AgentPanel } from "./ui/panel.ts";
+import { isVisible, navigatorOrder, rowParts } from "./ui/rows.ts";
 
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 const BUILTIN_DIR = resolve(EXT_DIR, "..", "..", "agents");
@@ -26,6 +29,11 @@ const DEFAULT_PRINT_WAIT_MS = 30 * 60_000;
 /** 同一时刻完成的多个 subagent 的通知在这段时间内合并成一条，避免一次触发多轮。 */
 const NOTIFY_BATCH_MS = 150;
 
+/** subagent 成功完成后，底栏提示「/agents 查看」的时长，与 Claude Code 一致。 */
+const HINT_MS = 30_000;
+
+const WIDGET_KEY = "pi-subagents";
+
 export default function subagents(pi: ExtensionAPI) {
 	const env = process.env;
 	let ctxRef: ExtensionContext | undefined;
@@ -34,6 +42,51 @@ export default function subagents(pi: ExtensionAPI) {
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
 	/** 每个 agent 上次写入主会话时的关键字段，没变就不再写。 */
 	const persisted = new Map<string, string>();
+	/** 用户在面板里清除过的 agent，只影响显示。 */
+	let dismissed = new Set<string>();
+	let requestRender: (() => void) | undefined;
+	let ticker: ReturnType<typeof setInterval> | undefined;
+	let hintTimer: ReturnType<typeof setTimeout> | undefined;
+	const lastStatus = new Map<string, string>();
+
+	/** 有运行中或还在保留期的行时每秒刷新一次，好让耗时与保留期到点消失；没有时停下。 */
+	const ensureTicker = () => {
+		const active = () => !!orch && orch.registry.list().some((r) => isVisible(r, Date.now(), dismissed));
+		if (ticker || !active()) return;
+		ticker = setInterval(() => {
+			requestRender?.();
+			if (!active()) {
+				clearInterval(ticker);
+				ticker = undefined;
+			}
+		}, 1_000);
+		ticker.unref?.();
+	};
+
+	/** 界面跟随注册表变化：交互模式刷新面板，RPC 模式更新一行状态。 */
+	const onRegistryChange = () => {
+		const ctx = ctxRef;
+		if (!ctx || !orch) return;
+		if (ctx.mode === "tui") {
+			requestRender?.();
+			ensureTicker();
+		} else if (ctx.mode === "rpc") {
+			const running = orch.registry.list().filter((r) => r.status === "running").length;
+			ctx.ui.setStatus(WIDGET_KEY, running ? `subagents：${running} 个运行中` : undefined);
+		}
+	};
+
+	/** 某个 agent 刚成功完成时，在底栏提示可以用 /agents 查看，30 秒后消失。 */
+	const hintOnComplete = (id: string, status: string) => {
+		const before = lastStatus.get(id);
+		lastStatus.set(id, status);
+		const ctx = ctxRef;
+		if (before !== "running" || status !== "completed" || ctx?.mode !== "tui") return;
+		ctx.ui.setStatus(WIDGET_KEY, "/agents 查看 subagent");
+		clearTimeout(hintTimer);
+		hintTimer = setTimeout(() => ctxRef?.ui.setStatus(WIDGET_KEY, undefined), HINT_MS);
+		hintTimer.unref?.();
+	};
 
 	/** 把缓冲的通知作为一条消息送进主会话：空闲时立即开始新一轮，运行中时排到本轮结束后。 */
 	const flushNotifications = () => {
@@ -76,6 +129,7 @@ export default function subagents(pi: ExtensionAPI) {
 			warn,
 			forkMode,
 			onRecordChange: (record) => {
+				hintOnComplete(record.id, record.status);
 				const key = persistKey(record);
 				if (persisted.get(record.id) === key) return;
 				persisted.set(record.id, key);
@@ -95,6 +149,8 @@ export default function subagents(pi: ExtensionAPI) {
 		ctxRef = ctx;
 		orch = createOrchestrator(ctx);
 		persisted.clear();
+		lastStatus.clear();
+		dismissed = new Set();
 		for (const r of restoreRecords(ctx.sessionManager.getBranch())) {
 			orch.registry.restore(r);
 			persisted.set(r.id, persistKey(orch.registry.get(r.id) ?? r));
@@ -105,7 +161,66 @@ export default function subagents(pi: ExtensionAPI) {
 		for (const d of loaded.diagnostics) warn(`${d.path}：${d.message}`);
 		if (loaded.warning) warn(loaded.warning);
 		registerSubagentTools(pi, orch, { callerId: MAIN_ID, canNest: true, forkMode: forkMode() });
+		orch.registry.onChange(onRegistryChange);
+		if (ctx.mode === "tui") {
+			const registry = orch.registry;
+			ctx.ui.setWidget(
+				WIDGET_KEY,
+				(tui, theme) => {
+					requestRender = () => tui.requestRender();
+					return new AgentPanel(tui, theme, registry, dismissed);
+				},
+				{ placement: "belowEditor" },
+			);
+		}
 	});
+
+	const mainCaller = (ctx: ExtensionContext) => ({ id: MAIN_ID, cwd: ctx.cwd, model: ctx.model as NonNullable<ExtensionContext["model"]>, thinkingLevel: pi.getThinkingLevel(), activeTools: pi.getActiveTools() });
+
+	/** 打开 subagent 导航；非交互模式下退回文字列表。 */
+	const openNavigator = async (ctx: ExtensionContext, initial?: string) => {
+		const o = orch;
+		if (!o) return;
+		if (ctx.mode !== "tui") {
+			const now = Date.now();
+			const list = navigatorOrder(o.registry.list(), dismissed).map((r) => {
+				const p = rowParts(r, now);
+				return `${p.icon} ${p.title} ${r.id} ${p.status} · ${p.stats} · ${p.activity}`;
+			});
+			const text = list.length ? list.join("\n") : "本会话还没有派出过 subagent。";
+			if (ctx.hasUI) ctx.ui.notify(text, "info");
+			else console.log(text);
+			return;
+		}
+		const initialId = initial ? o.registry.list().find((r) => r.id === initial || r.name === initial)?.id : undefined;
+		let unsubscribe: (() => void) | undefined;
+		let refresh: ReturnType<typeof setInterval> | undefined;
+		try {
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+				unsubscribe = o.registry.onChange(() => tui.requestRender());
+				// 记录文件在子 agent 运行时持续追加，每秒重画一次好让记录视图跟上。
+				refresh = setInterval(() => tui.requestRender(), 1_000);
+				refresh.unref?.();
+				return new AgentNavigator(tui, theme, {
+					registry: o.registry,
+					dismissed,
+					initialId,
+					stop: async (id) => (await o.stop(id, mainCaller(ctx), true)).text,
+					send: async (id, text) => (await o.sendMessage(id, text, mainCaller(ctx), true)).text,
+				}, () => done());
+			});
+		} finally {
+			unsubscribe?.();
+			clearInterval(refresh);
+			requestRender?.();
+		}
+	};
+
+	pi.registerCommand("agents", {
+		description: "查看本会话的 subagent，打开某个 agent 的记录并直接给它发消息",
+		handler: async (args, ctx) => openNavigator(ctx, args.trim() || undefined),
+	});
+	pi.registerShortcut("ctrl+alt+a", { description: "打开 subagent 面板", handler: async (ctx) => openNavigator(ctx) });
 
 	// /subtask：用户直接 fork 当前对话去做一项任务，不受并发上限阻挡，与 Claude Code 一致。
 	pi.registerCommand("subtask", {
@@ -144,6 +259,10 @@ export default function subagents(pi: ExtensionAPI) {
 		clearTimeout(flushTimer);
 		flushTimer = undefined;
 		pending = [];
+		clearInterval(ticker);
+		ticker = undefined;
+		clearTimeout(hintTimer);
+		requestRender = undefined;
 		await orch?.shutdown();
 	});
 }

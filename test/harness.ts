@@ -42,6 +42,8 @@ export interface HarnessOptions {
 	ui?: boolean;
 	/** 记录 ui.notify 的内容。 */
 	notes?: string[];
+	/** 为 true 时界面的 setStatus 抛异常，用来验证界面故障不影响 agent。 */
+	brokenUi?: boolean;
 }
 
 const systemOf = (messages: any[]) => {
@@ -89,8 +91,17 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	await loader.reload();
 	const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, resourceLoader: loader, sessionManager: SessionManager.create(cwd, join(agentDir, "sessions")) });
 	if (opts.ui) {
-		// 用 Proxy 提供一个什么也不做的界面，只记录 notify，足够让扩展走交互模式的分支。
-		const uiContext = new Proxy({} as any, { get: (_t, prop) => (prop === "notify" ? (m: string) => opts.notes?.push(m) : () => undefined) });
+		// 一个什么也不做的界面，只记录 notify，足够让扩展走交互模式的分支。
+		// 必须是普通对象：pi 会用展开运算符复制它再包装，Proxy 上的方法复制不过去。
+		const noop = () => undefined;
+		const uiContext: any = { notify: (m: string) => opts.notes?.push(m) };
+		for (const k of ["setStatus", "setWidget", "setWorkingMessage", "setWorkingVisible", "setWorkingIndicator", "setHiddenThinkingLabel", "setFooter", "setHeader", "setTitle", "pasteToEditor", "setEditorText", "addAutocompleteProvider", "setEditorComponent", "setToolsExpanded", "onTerminalInput"]) uiContext[k] = noop;
+		for (const k of ["select", "input", "editor", "custom"]) uiContext[k] = async () => undefined;
+		uiContext.confirm = async () => false;
+		uiContext.getEditorText = () => "";
+		if (opts.brokenUi) uiContext.setStatus = () => {
+			throw new Error("ui broken");
+		};
 		await session.bindExtensions({ mode: "tui", uiContext });
 	} else {
 		await session.bindExtensions({ mode: "print" });

@@ -175,6 +175,10 @@ function wrap(session: AgentSession, transcriptPath: string | undefined): ChildH
 	let turnLimit: number | undefined;
 	let turns = 0;
 	let hitMaxTurns = false;
+	// 本次运行期间是否收到过中止请求。
+	// 后台运行没有中止信号，停止是直接调用 abort() 完成的。
+	// 工具执行中被中止时 prompt() 会抛出普通错误，只看信号或消息的 stopReason 会把「被停止」误判成「失败」。
+	let abortRequested = false;
 	const previousFinishTurn = session.agent.finishTurn;
 	session.agent.finishTurn = async (turn, signal) => {
 		const decision = await previousFinishTurn?.(turn, signal);
@@ -195,6 +199,7 @@ function wrap(session: AgentSession, transcriptPath: string | undefined): ChildH
 			turnLimit = hooks.maxTurns;
 			turns = 0;
 			hitMaxTurns = false;
+			abortRequested = false;
 			const unsubscribe = hooks.onEvent ? session.subscribe(hooks.onEvent) : undefined;
 			const onAbort = () => void session.abort();
 			hooks.signal?.addEventListener("abort", onAbort, { once: true });
@@ -210,7 +215,7 @@ function wrap(session: AgentSession, transcriptPath: string | undefined): ChildH
 				turnLimit = undefined;
 			}
 			const messages = session.messages.slice(before);
-			const aborted = hooks.signal?.aborted === true;
+			const aborted = hooks.signal?.aborted === true || abortRequested;
 			let outcome = extractOutcome(messages, { aborted, hitMaxTurns });
 			if (thrown && !aborted && outcome.kind === "completed") {
 				outcome = { text: outcome.text, kind: "error", errorMessage: thrown instanceof Error ? thrown.message : String(thrown) };
@@ -221,6 +226,7 @@ function wrap(session: AgentSession, transcriptPath: string | undefined): ChildH
 			await session.steer(text);
 		},
 		async abort() {
+			abortRequested = true;
 			await session.abort();
 		},
 		isStreaming() {

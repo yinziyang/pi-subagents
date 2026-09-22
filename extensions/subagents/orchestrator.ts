@@ -466,7 +466,11 @@ export class Orchestrator {
 	}
 
 	private changed(record: AgentRecord): void {
-		this.deps.onRecordChange?.(record);
+		try {
+			this.deps.onRecordChange?.(record);
+		} catch {
+			// 界面刷新与持久化是旁路，出错不能影响 agent 的状态流转，否则一次界面异常就会把成功的运行标成失败。
+		}
 	}
 
 	private reply(record: AgentRecord, def: AgentDefinition, result: RunResult): ToolReply {
