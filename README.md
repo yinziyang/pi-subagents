@@ -94,7 +94,7 @@ model: inherit
 | `maxTurns` | 是 | 到达上限后返回部分结果并标明，可以用 `send_message` 继续 |
 | `skills` | 是 | 启动时把这些 skill 的完整内容放进系统提示词 |
 | `background` | 是 | 为 `true` 时总在后台运行 |
-| `omitClaudeMd` | 是 | 别名 `omitAgentsMd`；为 `true` 时不加载 AGENTS.md 等上下文文件，也不注入 pi-coding-standards 的常驻规范 |
+| `omitClaudeMd` | 是 | 别名 `omitAgentsMd`；为 `true` 时不加载 AGENTS.md 等上下文文件，并通过子会话标记告知其他扩展不要注入常驻内容 |
 | `effort` | 是 | 映射到 pi 的 thinking level，`max` 按 `xhigh` 处理 |
 | `color` | 是 | 面板与记录里的颜色 |
 | `mcpServers` | 是 | 需要安装 pi-mcp-adapter，见下面「MCP」一节 |
@@ -114,7 +114,7 @@ model: inherit
 - 自己的系统提示词，不含 pi 的主系统提示词。
 - 主 agent 写的任务说明，看不到主对话的历史。fork 例外，它继承整个对话。
 - 项目的 AGENTS.md 等上下文文件。`omitClaudeMd`、Explore、Plan 除外。
-- 主会话加载的扩展，本包自身除外。例如 pi-coding-standards 在子 agent 里照常拦下不合规的写入。
+- 主会话加载的扩展，本包自身除外。例如检查文件写入的扩展，对子 agent 的写入同样生效。
 - 权限与主会话相同：pi 没有权限系统，子 agent 和主会话一样全部放行。
 - 主会话的全部 MCP 服务（装了 pi-mcp-adapter 时）。
 - 子 agent 里的扩展弹出的确认框会转到主会话，见下一节。
@@ -196,7 +196,9 @@ mcpServers:
 
 - 通过 `pi.events` 广播 `subagent:start` 与 `subagent:stop`，载荷是 `{ agentId, type, name, parentId, status, background, fork }`，对应 Claude Code 的 SubagentStart 与 SubagentStop。
 - 子 agent 会话里写有一条 `customType` 为 `pi-subagents-child` 的条目，其他扩展可以据此识别自己运行在 subagent 里。
-  - pi-coding-standards 据此对齐 Claude Code 的钩子语义：写入检查与规则送达照常生效；每轮提醒、收尾检查与决策留痕审计只在主会话运行。
+  - 条目的 `data` 是 `{ omitContextFiles, parentSessionId, agentId }`。
+  - `omitContextFiles` 为 `true` 表示定义里写了 `omitClaudeMd`，往系统提示词里注入常驻内容的扩展应该跳过这个子 agent。
+  - 想对齐 Claude Code 钩子语义的扩展可以据此区分：PreToolUse、PostToolUse 对应的逻辑在子 agent 里照常运行，UserPromptSubmit、Stop 对应的逻辑只在主会话运行。
 - pi-goal 在子 agent 里不起作用，目标只属于主会话。
 
 ## 与 Claude Code 的差异
