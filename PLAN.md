@@ -218,7 +218,7 @@ fork：
   - 目标已结束：在后台以同一 ID 开始新一轮运行，保留完整历史，之后照常送回完成通知。
   - 目标运行中：作为 steer 消息送达。
   - Explore、Plan 这类一次性 agent：拒绝并说明原因。
-  - 用户手动停止过的 agent：拒绝并说明它已被取消。
+  - 用户在面板里手动停止过的 agent：拒绝并说明它已被取消；模型用 `task_stop` 停止的不受影响，仍可恢复，与 Claude Code 一致。
   - 名字已被一个更新的 agent 占用：拒绝并说明这个名字现在指向谁，与 Claude Code 一致。
   - 调用参数里的 `model` 在恢复时继续生效。
 - `task_stop`，参数为 agent ID 或名字：中止运行中的 subagent，保留已经产生的输出。
@@ -226,7 +226,7 @@ fork：
 
 ### 3.9 记录持久化
 
-- 每个子 agent 的记录写在 `~/.pi/agent/subagent-sessions/<主会话 id>/agent-<agentId>.jsonl`，会话头部的 `parentSession` 指向主会话记录。
+- 每个子 agent 的记录写在 `~/.pi/agent/subagent-sessions/<主会话 id>/<时间戳>_<agentId>.jsonl`，文件名沿用 pi 自己的会话命名；会话头部的 `parentSession` 指向主会话记录。
 - 主会话里用自定义条目记录每个 agent 的 ID、名字、类型、记录路径、状态、调用时指定的模型，随分支保存，`/tree` 切换后按分支还原。
 - 主会话压缩不影响子 agent 记录。
 - 子 agent 按 pi 自己的规则自动压缩上下文。
@@ -338,7 +338,7 @@ pi-subagents/
 - 搭 faux provider 的集成测试基建：
   - 一个测试辅助函数，建好带本扩展的主会话。
   - 主会话与子会话共用同一个 faux 运行时，可以按顺序脚本化各自的回复。
-- 报告脚本 `test/e2e/report.py`：给定主会话 jsonl，列出每次 `agent` 调用、对应的子 agent 记录、状态、token、耗时。
+- E2E 脚本 `test/e2e/e2e.mjs`：在临时项目里跑真实 `pi -p`，解析主会话 jsonl 与对应的子 agent 记录，逐条断言。
 
 验收：
 
@@ -445,12 +445,12 @@ pi-subagents/
 3. 【集成】对已结束的 agent `send_message`：同一 ID 开始新一轮，历史完整（新请求里包含旧的消息），完成后送回通知。
 4. 【集成】对运行中的 agent `send_message`：作为 steer 送达，子会话在下一轮前收到。
 5. 【集成】对 `Explore` 发消息：拒绝，说明它是一次性的。
-6. 【集成】`task_stop` 运行中的 agent：状态变为 stopped，已有输出保留；之后模型对它 `send_message` 被拒绝。
+6. 【集成】`task_stop` 运行中的 agent：状态变为 stopped，已有输出保留；之后模型仍可以用 `send_message` 恢复它。用户在面板里手动停止的，模型的 `send_message` 被拒绝（P6 验收）。
 7. 【E2E】跨重启恢复：
    - 第一次 `pi -p` 让 `general-purpose` 记住「数字是 7」并返回 agent ID。
    - 第二次 `pi -p --session <同一会话>` 让模型用 `send_message` 问这个 agent 数字是几。
    - 回答是 7，子 agent 记录文件是同一个，并且多了一轮。
-8. 【E2E】记录文件位于 `~/.pi/agent/subagent-sessions/<主会话 id>/agent-<id>.jsonl`，头部 `parentSession` 指向主会话记录；`pi` 的 `/resume` 列表里不会出现子 agent 的记录。
+8. 【E2E】记录文件位于 `~/.pi/agent/subagent-sessions/<主会话 id>/<时间戳>_<id>.jsonl`，头部 `parentSession` 指向主会话记录；`pi` 的 `/resume` 列表里不会出现子 agent 的记录。
 9. 【TUI】主会话 `/compact` 之后，`/agents` 仍能打开之前的子 agent 记录，内容完整。
 
 ### P5 fork 与提示词缓存
@@ -573,4 +573,34 @@ pi-subagents/
 
 - 通过：社区对照表见上一节。
 - 通过：faux 同时驱动父子会话，`test/spike-faux.test.ts`。
-- 待做：报告脚本随 P2 的第一个 E2E 一起完成，届时补记。
+- 通过：E2E 脚本 `test/e2e/e2e.mjs` 已完成，改用 Node 与包本身保持同一种语言。
+
+### P1（2026-09-22）
+
+- 通过：单测 1 到 5（`test/definitions.test.ts`）。
+- 通过：E2E 6，临时项目里的 `reviewer` 与三个内置 agent 都被列出。
+- 通过：E2E 7，`--agents` 定义的 agent 被调用并原样返回标记。
+- 待做：TUI 8（启动诊断的显示）随 P6 一起验。
+
+### P2（2026-09-22）
+
+- 通过：单测 1、2（`test/report.test.ts`；模型解析顺序在 P2 集成测试与 E2E 中覆盖）。
+- 通过：集成 3 到 6（`test/foreground.test.ts`）。
+- 通过：E2E 7 到 12（`isolation`、`systemPrompt`、`extensions`、`tools`、`usage`）。
+  - 首轮发现内置 Explore、Plan 附加了项目 AGENTS.md，已在定义里补上 `omitClaudeMd: true`。
+  - `omitClaudeMd` 的 agent 仍被注入常驻规范，已按 3.12 改 coding-standards：读到子会话标记后，`omitClaudeMd` 时不注入常驻规范；子会话里不送每轮提醒、不做收尾检查与决策留痕审计。
+- 待做：TUI 13 随 P6 一起验。
+
+### P3（2026-09-22）
+
+- 通过：单测 1、2（`test/registry.test.ts`、`test/background.test.ts`）。
+- 通过：集成 3 到 6（`test/background.test.ts`），并行时峰值并发实测为 3。
+- 通过：E2E 7、8（`printWait`、`depth`）。
+- 待做：RPC 9（并发上限）。
+
+### P4（2026-09-22）
+
+- 通过：单测 1、2（`test/persistence.test.ts`、`test/registry.test.ts`）。
+- 通过：集成 3 到 6（`test/resume.test.ts`）。
+- 通过：E2E 7、8（`resumeAcrossRestart`）。
+- 待做：TUI 9 随 P6 一起验。

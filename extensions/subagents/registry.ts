@@ -181,6 +181,19 @@ export class AgentRegistry {
 		return { record: this.agents.get(latest) as AgentRecord };
 	}
 
+	/**
+	 * 切换分支后同步已结束的记录：不在新分支上的已结束记录移除，新分支上的记录还原。
+	 * 运行中的记录保持不变，它们的运行不随分支切换而停止。
+	 */
+	syncFinished(records: readonly AgentRecord[]): void {
+		const wanted = new Set(records.map((r) => r.id));
+		for (const r of this.list()) if (r.status !== "running" && !wanted.has(r.id)) this.agents.delete(r.id);
+		for (const r of records) if (this.agents.get(r.id)?.status !== "running") this.restore(r);
+		this.byName.clear();
+		for (const r of this.agents.values()) if (r.name) this.byName.set(r.name, r.id);
+		this.emit();
+	}
+
 	/** 移除已结束的记录，面板清除行时使用；运行中的不移除。 */
 	remove(id: string): boolean {
 		const r = this.agents.get(id);

@@ -193,6 +193,26 @@ const scenarios = {
 		check("第 2 层拿不到 agent 工具", second && !second.messages.some((m) => m.role === "system" && JSON.stringify(m).includes('"name":"agent"')));
 		return cwd;
 	},
+
+	/** P4-7、P4-8：重启 pi 后恢复会话，仍能用 send_message 续聊；子 agent 记录不出现在 pi 自己的会话目录里。 */
+	resumeAcrossRestart() {
+		const cwd = makeProject();
+		runPi(cwd, "用 agent 工具派一个 general-purpose 子 agent，name 设为 keeper，run_in_background 设为 false，任务原文是「记住数字 7。只回复：记住了。不要调用工具。」。完成后只回复 ok。");
+		const first = inspect(cwd);
+		const child = first.children[0];
+		const before = child ? child.messages.filter((m) => m.role === "assistant").length : 0;
+		const out = runPi(cwd, "用 send_message 发给 keeper，消息是「我让你记住的数字是几？只回复数字。」。收到它的结果通知后，把它的回答原样告诉我。", { args: ["--session", first.main.path] });
+		const second = inspect(cwd);
+		const again = second.children.find((c) => c.file === child?.file);
+		check("第二次运行正常退出", out.code === 0, out.stderr.slice(-300));
+		check("续聊写回同一个子 agent 记录", second.children.length === 1 && !!again, `子 agent 数 ${second.children.length}`);
+		check("子 agent 多了一轮回复", again && again.messages.filter((m) => m.role === "assistant").length > before);
+		check("最终回复里有数字 7", /7/.test(second.finalText), second.finalText.slice(0, 200));
+		const sessionsDir = join(AGENT_DIR, "sessions");
+		const leaked = readdirSync(sessionsDir).some((d) => statSync(join(sessionsDir, d)).isDirectory() && readdirSync(join(sessionsDir, d)).some((f) => child && f.includes(child.header.id)));
+		check("子 agent 记录不在 pi 的会话目录里（/resume 列表看不到）", !leaked);
+		return cwd;
+	},
 };
 
 // ---------- 入口 ----------

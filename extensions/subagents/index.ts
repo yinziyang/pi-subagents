@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadAgents } from "./definitions.ts";
 import { type NotificationDetails, Orchestrator } from "./orchestrator.ts";
+import { persistKey, RECORD_ENTRY, restoreRecords, toEntryData } from "./persistence.ts";
 import { AgentRegistry, limitsFromEnv, MAIN_ID } from "./registry.ts";
 import { parentRuntime } from "./runner.ts";
 import { registerSubagentTools } from "./tools.ts";
@@ -31,6 +32,8 @@ export default function subagents(pi: ExtensionAPI) {
 	let orch: Orchestrator | undefined;
 	let pending: Array<{ text: string; details: NotificationDetails }> = [];
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
+	/** 每个 agent 上次写入主会话时的关键字段，没变就不再写。 */
+	const persisted = new Map<string, string>();
 
 	/** 把缓冲的通知作为一条消息送进主会话：空闲时立即开始新一轮，运行中时排到本轮结束后。 */
 	const flushNotifications = () => {
@@ -72,6 +75,16 @@ export default function subagents(pi: ExtensionAPI) {
 			},
 			warn,
 			forkMode,
+			onRecordChange: (record) => {
+				const key = persistKey(record);
+				if (persisted.get(record.id) === key) return;
+				persisted.set(record.id, key);
+				try {
+					pi.appendEntry(RECORD_ENTRY, toEntryData(record));
+				} catch {
+					// 会话已被替换或正在关闭时写入会失败；这时记录只影响恢复会话后的续聊，丢了不影响当前运行。
+				}
+			},
 		});
 		return o;
 	};
@@ -81,12 +94,22 @@ export default function subagents(pi: ExtensionAPI) {
 		await orch?.shutdown();
 		ctxRef = ctx;
 		orch = createOrchestrator(ctx);
+		persisted.clear();
+		for (const r of restoreRecords(ctx.sessionManager.getBranch())) {
+			orch.registry.restore(r);
+			persisted.set(r.id, persistKey(orch.registry.get(r.id) ?? r));
+		}
 		const cliJson = pi.getFlag("agents");
 		const loaded = loadAgents({ cwd: ctx.cwd, agentDir: getAgentDir(), builtinDir: BUILTIN_DIR, cliJson: typeof cliJson === "string" ? cliJson : undefined });
 		orch.setAgents(loaded.agents);
 		for (const d of loaded.diagnostics) warn(`${d.path}：${d.message}`);
 		if (loaded.warning) warn(loaded.warning);
 		registerSubagentTools(pi, orch, { callerId: MAIN_ID, canNest: true, forkMode: forkMode() });
+	});
+
+	// /tree 切到另一条分支后，已结束的 agent 按那条分支还原；运行中的不受影响。
+	pi.on("session_tree", (_event, ctx) => {
+		orch?.registry.syncFinished(restoreRecords(ctx.sessionManager.getBranch()));
 	});
 
 	// -p 模式在 agent_settled 之后就拆掉会话，所以要在 agent_end 里等主会话的后台 subagent 结束，结果才不会丢。

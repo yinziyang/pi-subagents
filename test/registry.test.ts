@@ -84,3 +84,17 @@ test("onChange 在变化时通知，监听器抛错不影响状态", () => {
 	assert.equal(n, 2);
 	assert.equal(reg.get(a.id)?.activity, "read");
 });
+
+test("syncFinished：切换分支后只保留新分支上的已结束记录，运行中的不动", () => {
+	const reg = new AgentRegistry({ maxDepth: 3, maxConcurrent: 20 });
+	const running = reg.add(spec({ name: "live" }));
+	const done = reg.add(spec({ name: "old" }));
+	reg.update(done.id, { status: "completed" });
+	const other = { ...reg.get(done.id)!, id: "other-branch", name: "other" };
+	reg.syncFinished([other]);
+	assert.equal(reg.get(running.id)?.status, "running");
+	assert.equal(reg.get(done.id), undefined);
+	assert.equal(reg.get("other-branch")?.status, "completed");
+	assert.ok("record" in reg.resolve("other", MAIN_ID));
+	assert.ok("error" in reg.resolve("old", MAIN_ID));
+});
