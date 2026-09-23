@@ -9,7 +9,7 @@
 ## 安装
 
 ```bash
-pi install git:git@github.com:yinziyang/pi-subagents.git
+pi install git:https://github.com/yinziyang/pi-subagents.git
 ```
 
 需要 pi 0.87.0 或更高版本。
