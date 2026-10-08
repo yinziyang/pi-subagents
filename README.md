@@ -43,7 +43,8 @@ pi install git:https://github.com/yinziyang/pi-subagents.git
 
 - 前台：主 agent 等 subagent 完成，工具卡片实时显示进度，完成后折叠成一行统计，`Ctrl+O` 展开完整报告。
 - 后台：`agent` 工具立即返回 agent ID，subagent 完成后报告以一条「自动通知」送回主会话。
-  - 主会话空闲时，通知触发新一轮；运行中时，排到本轮结束后。
+  - 主会话空闲时，通知触发新一轮。
+  - 主会话运行中时，通知在当前工具调用结束后、下一次请求模型前送达，不必等本轮结束；主 agent 在本轮内用工具轮询等待结果也能收到。
   - 同时完成的多个通知合并成一条。
 - fork：`subagent_type` 设为 `fork`，或者用 `/subtask`。fork 继承到此为止的整个对话，系统提示词、工具、模型都和主会话一致，能复用主会话的提示词缓存。
   - fork 不能再派生 fork。

@@ -40,7 +40,7 @@ test("后台（交互模式）：立即返回 agent ID，完成后通知送回�
 	}
 });
 
-test("后台：主会话运行中时完成，通知排到本轮结束后送达，不打断当前一轮", async () => {
+test("后台：主会话运行中时完成，通知在当前工具调用结束后插入，不等本轮结束", async () => {
 	const h = await makeHarness({
 		ui: true,
 		route: async (req) => {
@@ -59,10 +59,45 @@ test("后台：主会话运行中时完成，通知排到本轮结束后送达�
 		await h.prompt("开始");
 		await waitFor(() => notifications(h.session).length === 1, 5_000, "通知");
 		await h.session.agent.waitForIdle();
-		const roles = (h.session.messages as any[]).map((m) => (m.role === "custom" ? "notify" : m.role === "assistant" ? `assistant:${resultText(m) || "tool"}` : m.role));
-		const end = roles.indexOf("assistant:本轮结束");
+		const roles = (h.session.messages as any[]).map((m) => (m.role === "custom" ? "notify" : m.role === "assistant" ? `assistant:${resultText(m) || "tool"}` : m.role === "toolResult" ? `tool:${m.toolName}` : m.role));
+		const ls = roles.indexOf("tool:ls");
 		const notify = roles.indexOf("notify");
-		assert.ok(end >= 0 && notify > end, `通知在本轮结束之后：${roles.join(" > ")}`);
+		const handled = roles.indexOf("assistant:处理通知");
+		assert.ok(ls >= 0 && notify > ls && handled > notify, `通知紧跟在 ls 的结果之后送达：${roles.join(" > ")}`);
+		assert.equal(roles.indexOf("assistant:本轮结束"), -1, `模型下一次请求就看到了通知：${roles.join(" > ")}`);
+	} finally {
+		await h.close();
+	}
+});
+
+test("后台：主 agent 在本轮内反复调用工具轮询等待时，通知照样送达，不会互相等死", async () => {
+	let polls = 0;
+	const h = await makeHarness({
+		ui: true,
+		route: async (req) => {
+			if (isGeneralPurpose(req)) {
+				await sleep(100);
+				return text("poll-report");
+			}
+			if (isNotification(req.last)) return text("汇总：poll-report");
+			const last = lastToolResult(req)?.toolName;
+			if (last === "agent" || last === "ls") {
+				// 模拟模型用 sleep 之类的工具在本轮内干等通知；旧实现下通知要等本轮结束，这里会一直轮询到放弃。
+				polls += 1;
+				if (polls > 30) return text("放弃等待");
+				await sleep(50);
+				return fauxAssistantMessage(toolCall("ls", { path: "." }, `poll${polls}`), { stopReason: "toolUse" });
+			}
+			return bg("需要一点时间的任务");
+		},
+	});
+	try {
+		await h.prompt("开始");
+		await h.session.agent.waitForIdle();
+		const texts = (h.session.messages as any[]).filter((m) => m.role === "assistant").map((m) => resultText(m)).filter(Boolean);
+		assert.equal(notifications(h.session).length, 1);
+		assert.ok(!texts.includes("放弃等待"), `轮询期间就收到了通知：${texts.join(" > ")}`);
+		assert.equal(texts.at(-1), "汇总：poll-report");
 	} finally {
 		await h.close();
 	}

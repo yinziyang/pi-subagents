@@ -125,15 +125,21 @@ export default function subagents(pi: ExtensionAPI) {
 		hintTimer.unref?.();
 	};
 
-	/** 把缓冲的通知作为一条消息送进主会话：空闲时立即开始新一轮，运行中时排到本轮结束后。 */
-	const flushNotifications = () => {
+	/**
+	 * 把缓冲的通知作为一条消息送进主会话。
+	 * 主会话空闲时立即开始新一轮。
+	 * 运行中时默认按 steer 投递：当前工具调用结束后、下一次请求模型前送达，与 Claude Code 在下一个工具结果旁附上通知一致。
+	 * 不用 followUp 的原因：followUp 要等本轮彻底结束才送达，主 agent 若在本轮内用 sleep 之类的工具轮询等结果，两边会互相等死（实测 pictl 会话卡了 14 分钟）。
+	 * @param deliverAs `-p` 模式在 agent_end 收尾时传 followUp，此时本轮已不会再调用工具，沿用实测通过的投递方式。
+	 */
+	const flushNotifications = (deliverAs: "steer" | "followUp" = "steer") => {
 		clearTimeout(flushTimer);
 		flushTimer = undefined;
 		const batch = pending.splice(0);
 		if (!batch.length) return;
 		const content = batch.map((b) => b.text).join("\n\n---\n\n");
 		const details: NotificationDetails = { agents: batch.flatMap((b) => b.details.agents) };
-		pi.sendMessage({ customType: NOTIFY_TYPE, content, display: true, details }, { deliverAs: "followUp", triggerTurn: true });
+		pi.sendMessage({ customType: NOTIFY_TYPE, content, display: true, details }, { deliverAs, triggerTurn: true });
 	};
 
 	pi.registerFlag("agents", { description: "以 JSON 定义只在本次会话有效的 subagent，格式同 Claude Code 的 --agents", type: "string" });
@@ -161,7 +167,7 @@ export default function subagents(pi: ExtensionAPI) {
 			notifyMain: (text, details) => {
 				if (o.isClosed()) return;
 				pending.push({ text, details });
-				flushTimer ??= setTimeout(flushNotifications, NOTIFY_BATCH_MS);
+				flushTimer ??= setTimeout(() => flushNotifications(), NOTIFY_BATCH_MS);
 			},
 			warn,
 			forkMode,
@@ -291,7 +297,7 @@ export default function subagents(pi: ExtensionAPI) {
 			if (!done) warn("等待后台 subagent 超时，剩余的已被中止");
 		}
 		// 必须在 agent_end 里当场送出，等定时器触发时 -p 的会话可能已经拆掉了。
-		flushNotifications();
+		flushNotifications("followUp");
 	});
 
 	pi.on("session_shutdown", async () => {

@@ -152,7 +152,9 @@ thinking level：继承主会话，定义里的 `effort` 优先。
   - 用 `PI_FORK_SUBAGENT=1` 或 `0` 强制开关。
 - 通知的送达：
   - 主会话空闲：`pi.sendMessage` 带 `triggerTurn` 立即开始新一轮。
-  - 主会话运行中：以 `deliverAs: "followUp"` 排队。
+  - 主会话运行中：以 `deliverAs: "steer"` 投递，当前工具调用结束后、下一次请求模型前送达。
+    - 不用 `followUp`：它要等本轮彻底结束才送达，主 agent 若在本轮内用 sleep 之类的工具轮询等结果，两边会互相等死。
+    - `-p` 模式在 `agent_end` 收尾时仍用 `followUp`，那时本轮已不会再调用工具。
   - 同一时刻完成的多个 agent，在 150ms 内合并成一条通知。
 - `-p` 模式下主 agent 结束时如果还有后台子 agent 在运行，就在 `agent_end` 里等它们结束，再把通知作为追加消息送回主会话，结果不会丢。
   - 等待有上界，默认 30 分钟，环境变量 `PI_SUBAGENT_PRINT_WAIT_MS` 可改；超时后中止剩余子 agent，通知里写明超时。
