@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { type AgentSessionEvent, type ExtensionFactory, type ExtensionUIContext, loadSkills, type ModelRuntime, type SettingsManager, stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type AgentDefinition, effortToThinking, resolveModel, resolveTools } from "./definitions.ts";
 import { buildForkEntries, type ForkEntry, forkDirective } from "./fork.ts";
-import { inlineServersExtension, MCP_TOOL } from "./mcp.ts";
+import { BUILTIN_MCP, inlineServersExtension, mcpExcludes, mcpToolEntries } from "./mcp.ts";
 import { AgentRegistry, type AgentRecord, MAIN_ID } from "./registry.ts";
 import { addUsage, apiErrorMessage, briefArgs, formatReport, messageText, oneLine, type RunOutcome, type UsageTotals } from "./report.ts";
 import { type ChildHandle, createChild, type RunResult } from "./runner.ts";
@@ -92,6 +92,8 @@ export interface OrchestratorDeps {
 	childUI?: (label: string, closed: AbortSignal) => ExtensionUIContext | undefined;
 	/** 项目是否已被信任；项目级定义里的内联 MCP 服务只在信任后注册，对齐 Claude Code。 */
 	isProjectTrusted?: () => boolean;
+	/** 主会话是否开着 MCP；为 false（`--no-mcp` 或设置里 `-builtin:mcp`）时子会话也不加载，不传视为开着。 */
+	mcpEnabled?: () => boolean;
 	settingsManager?: SettingsManager;
 	/** 注册表变化时通知界面与持久化。 */
 	onRecordChange?: (record: AgentRecord) => void;
@@ -160,7 +162,7 @@ export class Orchestrator {
 		const available = unique([...caller.activeTools.filter((t) => !OWN_TOOLS.includes(t)), ...EXTRA_READ_TOOLS, ...(canNest ? [TOOL_AGENT] : []), TOOL_SEND, TOOL_STOP]);
 		const resolved = resolveTools(def, available);
 		if ("error" in resolved) return { text: `subagent「${def.name}」无法启动：${resolved.error}`, isError: true };
-		resolved.tools = this.withMcpTool(def, available, resolved.tools);
+		if (this.mcpOn()) resolved.tools = unique([...resolved.tools, ...mcpToolEntries(def)]);
 		const { model, warning } = resolveModel(params.model ?? def.model, this.deps.env.PI_SUBAGENT_MODEL, caller.model, runtime, params.model === undefined && def.model === "inherit");
 		if (warning) this.deps.warn(warning);
 		const background = this.decideBackground(def, params);
@@ -191,6 +193,7 @@ export class Orchestrator {
 				model,
 				thinkingLevel: (effortToThinking(def.effort) as ThinkingLevel | undefined) ?? caller.thinkingLevel,
 				tools: resolved.tools,
+				...this.childMcp(def),
 				systemPrompt: def.systemPrompt || undefined,
 				appendSystemPrompt: this.preloadSkills(def, caller.cwd),
 				omitContextFiles: def.omitContextFiles === true,
@@ -198,7 +201,7 @@ export class Orchestrator {
 				parentSessionId: this.deps.mainSession().id,
 				parentSessionFile: this.deps.mainSession().file,
 				isSelfExtension: this.deps.isSelfExtension,
-				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth), false), ...this.mcpExtensions(def, resolved.tools)],
+				extensionFactories: [this.deps.childExtension(id, this.registry.canNest(record.depth), false), ...this.mcpExtensions(def)],
 				uiContext: this.childUI(record),
 				settingsManager: this.deps.settingsManager,
 			});
@@ -233,6 +236,8 @@ export class Orchestrator {
 		const entries = branch && buildForkEntries(branch, { toolCallId: caller.toolCallId, newId: () => randomBytes(4).toString("hex"), now: Date.now, stripSignedThinking: caller.model.api === "anthropic-messages" });
 		if (!entries) return { text: "找不到发起 fork 的那条消息，无法构造 fork 的上下文。", isError: true };
 		const id = randomBytes(8).toString("hex");
+		// 主会话的 activeTools 带着 direct 暴露的 mcp__ 工具名，按 SDK 规则会滤掉其余 MCP 工具，补上 mcp__* 才与主会话一致。
+		const forkTools = this.mcpOn() ? unique([...caller.activeTools, "mcp__*"]) : caller.activeTools;
 		const record = this.registry.add({
 			id,
 			name: p.name?.trim() || undefined,
@@ -243,7 +248,7 @@ export class Orchestrator {
 			fork: true,
 			oneShot: false,
 			model: `${caller.model.provider}/${caller.model.id}`,
-			tools: caller.activeTools,
+			tools: forkTools,
 		});
 		this.changed(record);
 		let handle: ChildHandle;
@@ -255,7 +260,8 @@ export class Orchestrator {
 				runtime,
 				model: caller.model,
 				thinkingLevel: caller.thinkingLevel,
-				tools: caller.activeTools,
+				tools: forkTools,
+				...this.childMcp(),
 				omitContextFiles: false,
 				source: { kind: "fork", dir: this.storageDir(), entries: entries as never },
 				parentSessionId: this.deps.mainSession().id,
@@ -304,11 +310,12 @@ export class Orchestrator {
 				model,
 				thinkingLevel: (effortToThinking(def?.effort) as ThinkingLevel | undefined) ?? caller.thinkingLevel,
 				tools: record.tools,
+				...this.childMcp(def),
 				omitContextFiles: def?.omitContextFiles === true,
 				source: { kind: "open", path: record.transcriptPath },
 				parentSessionId: this.deps.mainSession().id,
 				isSelfExtension: this.deps.isSelfExtension,
-				extensionFactories: [this.deps.childExtension(record.id, this.registry.canNest(record.depth), record.fork), ...(def ? this.mcpExtensions(def, record.tools) : [])],
+				extensionFactories: [this.deps.childExtension(record.id, this.registry.canNest(record.depth), record.fork), ...(def ? this.mcpExtensions(def) : [])],
 				uiContext: this.childUI(record),
 				settingsManager: this.deps.settingsManager,
 			});
@@ -512,25 +519,28 @@ export class Orchestrator {
 		return (closed) => childUI(label, closed);
 	}
 
-	/** 定义写了 mcpServers 时保证子 agent 拿到 mcp 工具，即使 tools 列表没写它；disallowedTools 显式移除时不加。 */
-	private withMcpTool(def: AgentDefinition, available: readonly string[], tools: string[]): string[] {
-		if (!def.mcpServers) return tools;
-		if (!available.includes(MCP_TOOL)) {
-			this.deps.warn(`subagent「${def.name}」定义了 mcpServers，但当前没有 ${MCP_TOOL} 工具（需要安装 pi-mcp-adapter），已忽略`);
-			return tools;
-		}
-		const removed = resolveTools({ tools: [MCP_TOOL], disallowedTools: def.disallowedTools }, [MCP_TOOL]);
-		if ("error" in removed || !removed.tools.length || tools.includes(MCP_TOOL)) return tools;
-		return [...tools, MCP_TOOL];
+	private mcpOn(): boolean {
+		return this.deps.mcpEnabled?.() !== false;
+	}
+
+	/** 创建子会话时的 MCP 选项：主会话关了 MCP 时子会话也关；定义里 disallowedTools 的 MCP 条目作为 excludeTools。 */
+	private childMcp(def?: AgentDefinition): { excludeTools?: string[]; disabledBuiltinExtensions?: string[] } {
+		if (!this.mcpOn()) return { disabledBuiltinExtensions: [BUILTIN_MCP] };
+		return def ? { excludeTools: mcpExcludes(def) } : {};
 	}
 
 	/**
-	 * 把定义里的内联 MCP 服务注册进子会话；子 agent 没有 mcp 工具时用不上，不注册。
+	 * 把定义里的内联 MCP 服务注册进子会话。
+	 * 主会话关了 MCP 时不注册并提示一次。
 	 * 项目级定义要等项目被信任，对齐 Claude Code 的目录信任规则。
 	 */
-	private mcpExtensions(def: AgentDefinition, tools: readonly string[]): ExtensionFactory[] {
+	private mcpExtensions(def: AgentDefinition): ExtensionFactory[] {
 		const inline = def.mcpServers?.inline ?? [];
-		if (!inline.length || !tools.includes(MCP_TOOL)) return [];
+		if (!inline.length) return [];
+		if (!this.mcpOn()) {
+			this.deps.warn(`主会话关闭了 MCP，subagent「${def.name}」的内联 MCP 服务 ${inline.map((s) => s.name).join("、")} 没有启动`);
+			return [];
+		}
 		if (def.source === "project" && this.deps.isProjectTrusted?.() === false) {
 			this.deps.warn(`项目还没有被信任，subagent「${def.name}」的内联 MCP 服务 ${inline.map((s) => s.name).join("、")} 没有启动。信任项目后生效，非交互模式可加 --approve`);
 			return [];

@@ -294,31 +294,38 @@ const scenarios = {
 		return cwd;
 	},
 
-	/** 第 8 节 6：定义里的内联 MCP 服务只给子 agent 用，进程随子 agent 退出；需要安装 pi-mcp-adapter。 */
+	/**
+	 * 第 8 节 6：子 agent 用 pi 内置的 MCP。
+	 * 项目 .pi/mcp.json 里的 probe 走默认的 codemode 暴露，browser 定义只给 read 并声明 probe 与内联服务 inl。
+	 * 验证：browser 调到 inl 与 probe；general-purpose 继承 probe；主会话自己也能调 probe，但调不到 inl；所有服务进程都退出。
+	 */
 	mcpInline() {
-		const settings = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
-		if (!(settings.packages ?? []).some((p) => String(typeof p === "string" ? p : p.source).includes("pi-mcp-adapter"))) {
-			console.log("  SKIP 没有安装 pi-mcp-adapter");
-			return undefined;
-		}
 		const cwd = makeProject();
 		const log = join(cwd, "probe.log");
 		const server = (name) => ({ command: "node", args: [PROBE_SERVER], env: { PROBE_NAME: name, PROBE_LOG: log } });
-		writeFileSync(join(cwd, ".mcp.json"), JSON.stringify({ mcpServers: { probe: server("probe") } }));
 		mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { probe: server("probe") } }));
 		const inline = JSON.stringify([{ inl: server("inl") }, "probe"]);
 		writeFileSync(join(cwd, ".pi", "agents", "browser.md"), md(`name: browser\ndescription: 通过 MCP 服务做测试\ntools: read\nmcpServers: ${inline}`, "你是 browser 子 agent。按任务要求调用 MCP 工具并如实报告工具返回的原文。"));
-		runPi(cwd, "用 agent 工具派一个 browser 子 agent，run_in_background 设为 false，任务原文是「用 mcp 工具分别调用 inl 服务和 probe 服务的 whoami 工具，把两次返回的原文都报告出来」。它返回后，你自己调用一次 mcp({}) 查看服务列表，然后回复 done。");
+		runPi(
+			cwd,
+			"按顺序做三件事，每件做完再做下一件：1. 用 agent 工具派一个 browser 子 agent，run_in_background 设为 false，任务原文是「分别调用 inl 服务和 probe 服务的 whoami 工具（probe 的工具如果不能直接调用，就用 codemode 调用），把两次返回的原文都报告出来」。2. 用 agent 工具派一个 general-purpose 子 agent，run_in_background 设为 false，任务原文是「调用 probe 服务的 whoami 工具（不能直接调用就用 codemode），报告返回的原文」。3. 你自己调用 probe 服务的 whoami 工具（同样可以用 codemode），然后尝试直接调用 mcp__inl__whoami。最后回复 done。",
+			{ args: ["--approve"] },
+		);
 		const r = inspect(cwd);
-		const child = r.children[0];
-		const childResults = child ? child.messages.filter((m) => m.role === "toolResult" && m.toolName === "mcp").map(textOf).join("\n") : "";
-		const mainStatus = r.messages.filter((m) => m.role === "toolResult" && m.toolName === "mcp").map(textOf).join("\n");
+		const results = (msgs) => msgs.filter((m) => m.role === "toolResult").map(textOf).join("\n");
+		const browser = r.children.find((c) => c.system.includes("你是 browser 子 agent"));
+		const general = r.children.find((c) => c !== browser);
+		const browserSaw = browser ? results(browser.messages) : "";
+		const generalSaw = general ? results(general.messages) : "";
+		const mainSaw = results(r.messages.filter((m) => m.toolName !== "agent"));
 		const events = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [];
 		const started = new Set(events.filter((e) => e.event === "start").map((e) => e.pid));
 		const exited = new Set(events.filter((e) => e.event === "exit").map((e) => e.pid));
-		check("子 agent 调用到了内联服务与继承的服务", /I am inl/.test(childResults) && /I am probe/.test(childResults), childResults.slice(0, 200));
-		check("主会话的服务列表里没有内联服务", mainStatus.includes("probe") && !/\binl\b/.test(mainStatus), mainStatus.slice(0, 200));
-		check("内联服务的进程启动过并已退出", events.some((e) => e.name === "inl" && e.event === "start") && events.some((e) => e.name === "inl" && e.event === "exit"));
+		check("browser 子 agent 调到了内联服务 inl 与声明的 probe", /I am inl/.test(browserSaw) && /I am probe/.test(browserSaw), browserSaw.slice(0, 300));
+		check("general-purpose 子 agent 继承了 probe", /I am probe/.test(generalSaw), generalSaw.slice(0, 300));
+		check("主会话能调 probe，调不到 inl", /I am probe/.test(mainSaw) && !/I am inl/.test(mainSaw), mainSaw.slice(0, 300));
+		check("inl 只在子会话里启动过一次", events.filter((e) => e.name === "inl" && e.event === "start").length === 1);
 		check("所有 MCP 服务进程都已退出", started.size > 0 && [...started].every((p) => exited.has(p)), `启动 ${started.size}，退出 ${exited.size}`);
 		return cwd;
 	},

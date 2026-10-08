@@ -173,6 +173,9 @@ export default function subagents(pi: ExtensionAPI) {
 			forkMode,
 			childUI: (label, closed) => (mainUI() ? forwardDialogs(label, mainUI, dialogs, closed) : undefined),
 			isProjectTrusted: () => ctx.isProjectTrusted(),
+			// 主会话没有 /mcp 命令，说明内置 MCP 被 --no-mcp 或设置里的 -builtin:mcp 关掉了。
+			// 装了第三方 MCP 扩展时 /mcp 归它，子会话也会加载它，内置的让位。
+			mcpEnabled: () => pi.getCommands().some((c) => c.name === "mcp"),
 			onRecordChange: (record) => {
 				onTransition(record);
 				const key = persistKey(record);

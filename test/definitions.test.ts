@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { DESCRIPTION_TOKEN_WARN, loadAgents, parseAgentFile, parseCliAgents, parseMcpServers, projectAgentDirs, renderAgentRoster, resolveTools } from "../extensions/subagents/definitions.ts";
+import { mcpExcludes, mcpToolEntries } from "../extensions/subagents/mcp.ts";
 
 const BUILTIN_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "agents");
 const md = (fm: string, body = "正文") => `---\n${fm}\n---\n${body}\n`;
@@ -192,4 +193,19 @@ test("resolveModel：调用参数 > 定义 > PI_SUBAGENT_MODEL > 调用方模型
 	assert.equal(effortToThinking("max"), "xhigh");
 	assert.equal(effortToThinking("low"), "low");
 	assert.equal(effortToThinking(undefined), undefined);
+});
+
+test("resolveTools：tools 里 mcp__ 开头的条目原样作为模式保留，不要求派出时已连上；旧写法 mcp 等同全部 MCP 工具", () => {
+	const available = ["read", "bash", "mcp__probe__whoami"];
+	assert.deepEqual(resolveTools({ tools: ["Read", "mcp__docs__*"] }, available), { tools: ["read", "mcp__docs__*"] });
+	assert.deepEqual(resolveTools({ tools: ["mcp__docs__search"] }, available), { tools: ["mcp__docs__search"] }, "只有 MCP 条目也能启动");
+	assert.deepEqual(resolveTools({ tools: ["mcp"] }, available), { tools: ["mcp__*"] });
+	assert.deepEqual(resolveTools({ disallowedTools: ["mcp__probe__whoami"] }, available), { tools: ["read", "bash"] }, "精确的 MCP 工具名照样从继承列表里移除");
+});
+
+test("MCP 白名单条目与排除项：继承全部时放开 mcp__*；声明的服务按名字放开，引用的服务带上 codemode 与 tool_search；disallowedTools 的 MCP 条目进 excludeTools", () => {
+	assert.deepEqual(mcpToolEntries({}), ["mcp__*"]);
+	assert.deepEqual(mcpToolEntries({ tools: ["read"], mcpServers: { refs: ["dev-radius"], inline: [{ name: "inl", config: {} }] } }), ["mcp__dev_radius__*", "mcp__inl__*", "codemode", "tool_search"]);
+	assert.deepEqual(mcpToolEntries({ tools: ["read"], mcpServers: { refs: [], inline: [{ name: "inl", config: {} }] } }), ["mcp__inl__*"]);
+	assert.deepEqual(mcpExcludes({ disallowedTools: ["Bash", "mcp__probe__*", "mcp"] }), ["mcp__probe__*", "mcp__*"]);
 });

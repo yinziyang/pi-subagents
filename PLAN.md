@@ -27,7 +27,7 @@
 ### 本期不做
 
 - 权限模式（`permissionMode`）、权限规则、auto 分类器：后续单独做权限包，届时 subagent 接入。
-- MCP 与 `mcpServers` 字段：pi 没有 MCP，后续单独做。已在第 8 节完成，MCP 本身由 pi-mcp-adapter 提供。
+- MCP 与 `mcpServers` 字段：已在第 8 节完成，2026-10-08 起改用 pi 内置的 MCP，见 8.4。
 - `isolation: worktree`：放第二期。
 - `memory` 字段：放第二期。
 - `--agent` 让整个主会话以某个 agent 身份运行，以及 `initialPrompt` 字段：放第二期。
@@ -590,6 +590,57 @@ MCP 本身不自己实现，直接使用社区最成熟的 pi-mcp-adapter（2.36
 7. 真实 pi：项目未被信任时不启动项目级定义的内联服务并给出提示，`--approve` 后启动。
 8. 真实 TUI：后台子 agent 调用 `approveTools` 里的工具时主会话弹出确认框；允许、拒绝、两个并行请求依次显示都符合预期；`/quit` 后无残留进程。
 9. 已有的单元、集成、E2E、RPC 场景全部回归通过。
+
+### 8.4 改用 pi 内置 MCP（2026-10-08）
+
+pi 1.1.0 起内置 MCP，pi-mcp-adapter 不再需要，8.1 到 8.3 里依赖适配器的部分由本节取代，确认框转发不变。
+
+实测（pi 1.1.0，零依赖 stdio 探针服务）：
+
+- 不装适配器时主会话的内置 MCP 正常。
+- 未改动的本包：子 agent 的工具里既没有 `mcp__` 工具，也没有 `codemode`、`tool_search`。原因是 SDK 创建的会话不自动加载内置扩展，卸载适配器后子 agent 完全用不了 MCP。
+- 把 `createMcpExtension`、`createCodemodeExtension`、`createToolSearchExtension` 以 `builtin`、`replaceable` 标记注入子会话后，子会话自己起服务进程并调用成功，子会话结束时进程退出。
+- 内联服务经 `pi.registerMcpServer()` 注册后进程能起来，但工具被过滤掉了：SDK 的白名单里只要有一项以 `mcp__` 开头，就只保留匹配的 MCP 工具，而从主会话继承的工具名里恰好有 direct 暴露的 `mcp__` 工具。
+
+设计：
+
+- 每个子会话注入一份新的内置扩展，带与 CLI 相同的标记，加载器按 CLI 的规则处理设置里的 `-builtin:mcp` 与第三方 MCP 扩展的接管。
+- 主会话没有 `/mcp` 命令时视为关掉了 MCP（`--no-mcp` 或 `-builtin:mcp`），子会话传 `disabledBuiltinExtensions: ["mcp"]` 一起关掉。
+- 工具白名单追加 MCP 条目：
+  - 定义没写 `tools` 时加 `mcp__*`，主会话后连上的服务也能用。
+  - `mcpServers` 声明的服务加 `mcp__<服务>__*`，服务名里字母、数字、下划线以外的字符按 pi 的规则换成下划线。
+  - 有引用的服务时再加 `codemode` 与 `tool_search`，默认 codemode 暴露的服务要靠它们调用。
+  - fork 在主会话的 `activeTools` 之外加 `mcp__*`，登记记录里也存这一份，续聊时一致。
+- 定义里的 MCP 工具条目：
+  - `tools` 里以 `mcp__` 开头的条目原样作为模式，不要求派出时已连上。
+  - `disallowedTools` 里的 MCP 条目经 `excludeTools` 交给子会话，模式同样生效。
+  - 旧写法 `mcp` 等同 `mcp__*`。
+- 内联服务在子会话的扩展加载时注册，没写 `exposure` 的默认 `direct`，与 Claude Code 一样直接可见。
+- 内联服务与 `mcp.json` 同名时以 `mcp.json` 为准。
+- 简化：每个子会话各自连接，不复用主会话的连接，服务进程多到成为负担时改为在主会话里代理调用。
+
+验收标准：
+
+1. 主会话与 general-purpose 子 agent 都能直接调用 `mcp.json` 里的服务。
+   - 子会话连的是自己起的进程，结束即退出。
+2. 内联服务只给定义它的子 agent。
+   - `tools` 只写 `read` 时声明的服务照样可用。
+   - 主会话调不到内联服务。
+3. `disallowedTools: mcp__probe__*` 时子 agent 拿不到该服务的工具。
+4. 主会话关掉 MCP 时子会话也不加载，内联服务提示没有启动，不拉起任何服务进程。
+5. 真实 pi：项目 `.pi/mcp.json` 的服务走默认 codemode 暴露，`tools: read` 的定义经 codemode 调到它。
+   - 内联服务、general-purpose 继承、主会话调用都符合 1 到 3。
+   - 所有服务进程退出。
+6. 已有的单元、集成、E2E、RPC 场景全部回归通过。
+
+验收记录（pi 1.1.0，开发依赖同步升到 1.1.0）：
+
+- 通过：1 到 4，`test/mcp.test.ts`，主会话按 CLI 的方式加载内置 MCP，子会话靠本包注入，服务用真实的 stdio 探针。
+  - 变异验证：去掉注入时 1、2 失败，去掉白名单条目时 2 失败，去掉 `excludeTools` 时 3 失败。
+- 通过：5，E2E 场景 `mcpInline`。
+- 通过：6，`npm test` 82 项、类型检查、`e2e.mjs` 全部场景、`rpc.mjs` 全部场景。
+  - `extensions` 与 `stopChecksMainOnly` 两个场景依赖 pi-coding-standards，测试用的 agent 目录加载它之后通过。
+- 通过：pictl 驱动的真实 RPC 会话里，主会话经 codemode 调到 `mcp.json` 的服务，前台与后台 general-purpose 子 agent 各自起服务进程调用成功、结束即退出，后台的报告经通知送回。
 
 ## 附录：社区实现对照
 

@@ -52,6 +52,8 @@ export interface HarnessOptions {
 	extensionFiles?: Record<string, string>;
 	/** ui 为 true 时主会话 ui.select 的实现，默认返回 undefined。 */
 	select?: (title: string, options: string[], opts?: any) => Promise<string | undefined>;
+	/** 写进 agentDir/mcp.json 的用户级 MCP 配置。 */
+	mcpConfig?: Record<string, unknown>;
 }
 
 const systemOf = (messages: any[]) => {
@@ -69,6 +71,7 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	mkdirSync(agentDir, { recursive: true });
 	// 关掉自动重试，模型出错的用例才不会等退避。
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false }, ...opts.settings }));
+	if (opts.mcpConfig) writeFileSync(join(agentDir, "mcp.json"), JSON.stringify(opts.mcpConfig));
 	for (const [file, content] of Object.entries(opts.extensionFiles ?? {})) {
 		mkdirSync(join(agentDir, "extensions"), { recursive: true });
 		writeFileSync(join(agentDir, "extensions", file), content);

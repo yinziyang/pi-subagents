@@ -12,7 +12,7 @@
 pi install git:https://github.com/yinziyang/pi-subagents.git
 ```
 
-需要 pi 0.87.0 或更高版本。
+需要 pi 1.1.0 或更高版本，MCP 用的是 pi 内置的支持。
 安装后新开一个 pi 会话，启动信息的 Extensions 列表里会出现 `yinziyang/pi-subagents:subagents`。
 
 ## 用法
@@ -98,7 +98,7 @@ model: inherit
 | `omitClaudeMd` | 是 | 别名 `omitAgentsMd`；为 `true` 时不加载 AGENTS.md 等上下文文件，并通过子会话标记告知其他扩展不要注入常驻内容 |
 | `effort` | 是 | 映射到 pi 的 thinking level，`max` 按 `xhigh` 处理 |
 | `color` | 是 | 面板与记录里的颜色 |
-| `mcpServers` | 是 | 需要安装 pi-mcp-adapter，见下面「MCP」一节 |
+| `mcpServers` | 是 | 用 pi 内置的 MCP，见下面「MCP」一节 |
 | `permissionMode` | 否 | pi 目前没有权限系统，读到时忽略 |
 | `hooks`、`memory`、`isolation`、`initialPrompt`、`experimental` | 否 | 读到时启动提示「本期不支持」，定义照常加载 |
 
@@ -117,61 +117,66 @@ model: inherit
 - 项目的 AGENTS.md 等上下文文件。`omitClaudeMd`、Explore、Plan 除外。
 - 主会话加载的扩展，本包自身除外。例如检查文件写入的扩展，对子 agent 的写入同样生效。
 - 权限与主会话相同：pi 没有权限系统，子 agent 和主会话一样全部放行。
-- 主会话的全部 MCP 服务（装了 pi-mcp-adapter 时）。
+- `mcp.json` 里配置的全部 MCP 服务，见下面「MCP」一节。
 - 子 agent 里的扩展弹出的确认框会转到主会话，见下一节。
 
 子 agent 的报告交回主 agent 前会做注入扫描：模仿 `<system-reminder>` 这类标签、或行首是 `Human:` 的文字会被插入反斜杠而失效，并在报告前加标记说明其中的指令不代表用户。
 
 ## MCP
 
-MCP 由 [pi-mcp-adapter](https://www.npmjs.com/package/pi-mcp-adapter) 提供，本包负责让 subagent 按 Claude Code 的语义使用它：
+MCP 用 pi 1.1.0 起内置的支持，不需要再装 pi-mcp-adapter，配置写在 `~/.pi/agent/mcp.json` 与项目的 `.pi/mcp.json`，见 pi 文档的 MCP 一节。
 
-```bash
-pi install npm:pi-mcp-adapter
-```
+pi 用 SDK 创建的会话不会自动加载内置的 MCP、codemode、tool_search，本包在创建子会话时把它们注入进去，规则与主会话相同：
 
-- 子 agent 继承主会话配置的全部 MCP 服务，通过 `mcp` 工具调用。
+- 子 agent 能用 `mcp.json` 里的全部服务，工具名是 `mcp__<服务>__<工具>`，按服务的 `exposure` 直接调用或经 `codemode` 调用。
 - 每个子 agent 各自启动服务进程，子 agent 结束时进程随之退出。Claude Code 是与主会话共用连接。
-- 定义里的 `mcpServers` 是一个列表，每一项是服务名，或者「服务名: 配置」：
+- 主会话用 `--no-mcp` 启动、或者设置里写了 `"extensions": ["-builtin:mcp"]` 时，子 agent 也不加载 MCP。
+- 装了自带 `/mcp` 命令的第三方 MCP 扩展（例如 pi-mcp-adapter）时，主会话与子会话都让位给它，内联服务能不能用取决于它是否支持 `pi.registerMcpServer()`。
+
+定义里的 `mcpServers` 是一个列表，每一项是服务名，或者「服务名: 配置」：
 
 ```yaml
 ---
 name: browser-tester
 description: 用真实浏览器测试页面
+tools: Read, Grep
 mcpServers:
   # 内联定义：只给这个 subagent 用，主会话看不到它的工具
   - playwright:
       command: npx
       args: ["-y", "@playwright/mcp@latest"]
-  # 服务名：引用已经配置好的服务
+  # 服务名：引用 mcp.json 里已经配置好的服务
   - github
 ---
 ```
 
-- 内联定义的格式与 `.mcp.json` 里的服务条目相同，子 agent 启动时注册、结束时断开，工具经 `mcp` 工具调用。
-- 服务名引用只起声明作用，子 agent 本来就能用全部已配置的服务；名字写错时不会提前提示，调用时才会收到「服务不存在」的错误。
-- 定义写了 `mcpServers` 时，即使 `tools` 列表里没有 `mcp`，子 agent 也会拿到它；要禁止就在 `disallowedTools` 里写 `mcp`。
+- 内联定义的格式与 `mcp.json` 里的服务条目相同，子 agent 启动时经 `pi.registerMcpServer()` 注册、结束时断开。
+  - 没写 `exposure` 时默认 `direct`，子 agent 直接看到这些工具，与 Claude Code 一致。
+  - 与 `mcp.json` 里的服务同名时以 `mcp.json` 为准。
+  - 配置不合法时启动时给出提示，子 agent 照常运行。
+- `tools` 写了白名单时，`mcpServers` 里声明的服务（引用与内联）的工具会自动放开，引用的服务还会带上 `codemode` 与 `tool_search`，默认 `codemode` 暴露的服务要靠它们调用。
+- `tools` 与 `disallowedTools` 里可以直接写 MCP 工具名或模式，写法与 Claude Code 相同，例如 `mcp__github__search_code`、`mcp__github__*`。
+  - 这些条目不要求派出时服务已经连上。
+  - 旧写法 `mcp`（pi-mcp-adapter 的代理工具）等同全部 MCP 工具，`disallowedTools: mcp` 会禁用全部 MCP 工具。
+- 服务名引用不提前校验，名字写错时不会提示，子 agent 调用时才会收到工具不存在的错误。
 - 项目 `.pi/agents/` 里的定义，内联服务要等项目被信任后才启动，对齐 Claude Code 的目录信任规则。`-p` 等非交互模式加 `--approve`。
-  - 信任沿用 pi 的判定：项目里有 `.pi/settings.json`、`.pi/extensions` 这类需要信任的资源时才会被判为未信任。
-  - 只有 `.pi/agents/` 的项目按 pi 的规则视为已信任，这点比 Claude Code 宽松。在陌生仓库里使用前，先看一眼它的 `.pi/agents/` 与 `.mcp.json`。
-- 没装 pi-mcp-adapter、或者内联服务与已配置的服务重名时，启动时给出提示，子 agent 照常运行。
+  - 信任沿用 pi 的判定：项目里有 `.pi/settings.json`、`.pi/extensions`、`.pi/mcp.json` 这类需要信任的资源时才会被判为未信任。
+  - 只有 `.pi/agents/` 的项目按 pi 的规则视为已信任，这点比 Claude Code 宽松。在陌生仓库里使用前，先看一眼它的 `.pi/agents/`。
 
 ### 确认框转到主会话
 
 子 agent 里的扩展需要用户确认时，对话框显示在主会话里，标题前标明是哪个 subagent 发起的，与 Claude Code「后台 subagent 的权限请求在主会话里确认」一致。
-例如 pi-mcp-adapter 的 `approveTools`：
+例如权限类扩展在 `tool_call` 里拦下一次 MCP 调用、请用户确认时：
 
 ```
-[subagent general-purpose（a1）] MCP: probe wants to run echo
+[subagent general-purpose（a1）] probe wants to run echo
 → Allow once
-  Allow for session
-  Allow server for this session
   Deny
 ```
 
 - 多个 subagent 同时请求时排队，一次只显示一个。
 - subagent 被停止或结束时，它还没答复的对话框自动撤掉，按取消处理。
-- 「Allow for session」只在这个 subagent 里有效，它结束后就失效。
+- 扩展在子 agent 里记下的「本会话允许」只对这个 subagent 有效，它结束后就失效。
 - `-p` 模式没有界面，需要确认的操作按拒绝处理。
 - 只转发确认类对话框，子 agent 里的扩展不能改动主会话的状态栏、组件与主题。
 
@@ -208,7 +213,7 @@ mcpServers:
 - 定义文件放在 `.pi/agents/` 与 `~/.pi/agent/agents/`，格式与 `.claude/agents/` 相同，可以直接拷贝或建软链接。
 - `model` 不支持 `sonnet`、`opus` 这类别名，写 `provider/modelId` 或 pi 能解析的模型名。
 - 不支持权限模式、`memory`、`isolation: worktree`、`--agent`；pi 目前没有对应的机制，后续单独实现。
-- MCP 依赖 pi-mcp-adapter：每个子 agent 各自启动服务进程，服务名引用不提前校验，内联服务只经 `mcp` 代理工具调用。
+- MCP 用 pi 内置的支持：每个子 agent 各自启动服务进程，服务名引用不提前校验。
 - Explore 与 Plan 保留了 bash，只读性只由提示词约束，因为 pi 没有权限系统。
 - `-p` 模式下主 agent 会等后台 subagent 完成再退出，嵌套的子 agent 也总是等它派出的后台子 agent，结果不会丢。Claude Code 在非交互模式下不等。
 - 后台 subagent 的 token 用量显示在通知与面板里，不计入主会话底栏；前台的计入。
@@ -233,5 +238,5 @@ mcpServers:
 - `registry.ts`：agent 记录、父子树、名字解析与上限。
 - `persistence.ts`：记录在主会话里的保存与还原。
 - `tools.ts`：三个工具的定义与卡片渲染。
-- `mcp.ts`：与 pi-mcp-adapter 的对接，把内联 MCP 服务注册进子会话。
+- `mcp.ts`：与 pi 内置 MCP 的对接，给子会话注入内置扩展、算 MCP 工具白名单、注册内联服务。
 - `ui/`：面板、导航与记录视图；`ui/forward.ts` 把子 agent 的确认框转到主会话。

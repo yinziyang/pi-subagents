@@ -3,6 +3,7 @@
 // 子会话与主会话在同一个进程里，用 pi 的 SDK 创建。几条不能破坏的约束：
 //   - 模型运行时由调用方传入，通常复用主会话的，这样其他扩展注册的 provider 在子 agent 里也能用。
 //   - 本扩展自身不能被子会话再次加载，否则会递归；子 agent 需要的工具由调用方通过 extensionFactories 以闭包注入。
+//   - SDK 会话不会自动加载 pi 的内置 MCP、codemode、tool_search，这里统一注入，否则子 agent 连不上任何 MCP 服务，见 mcp.ts。
 //   - 必须先 bindExtensions，子会话里扩展的 session_start 才会触发。
 //   - AgentSession.dispose() 不会触发 session_shutdown，收尾时要自己先发出这个事件（有超时），再 dispose，否则子会话里扩展的资源会泄漏、websocket 会让进程无法退出。
 //   - close() 可以重复调用，只有第一次生效。
@@ -22,6 +23,7 @@ import {
 	type SessionEntry,
 	type SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { builtinMcpExtensions } from "./mcp.ts";
 import { countToolCalls, extractOutcome, type RunOutcome, sumUsage, type UsageTotals } from "./report.ts";
 
 /** 子会话里写入的标记条目，其他扩展据此识别自己运行在 subagent 里。 */
@@ -103,8 +105,12 @@ export interface ChildOptions {
 	runtime: ModelRuntime;
 	model: NonNullable<Parameters<typeof createAgentSession>[0]>["model"];
 	thinkingLevel?: NonNullable<Parameters<typeof createAgentSession>[0]>["thinkingLevel"];
-	/** 子 agent 可用的工具名。 */
+	/** 子 agent 的工具白名单，可以含 `mcp__*` 这样的模式，语义同 SDK 的 tools 选项。 */
 	tools: string[];
+	/** 白名单之后再移除的工具名或模式，MCP 工具同样适用；来自定义里以 `mcp__` 开头的 disallowedTools。 */
+	excludeTools?: string[];
+	/** 不加载的内置扩展，主会话关掉了 MCP（`--no-mcp` 或设置里 `-builtin:mcp`）时传 `["mcp"]`，子会话随之关掉。 */
+	disabledBuiltinExtensions?: string[];
 	/** 替换 pi 默认系统提示词的定义正文；fork 与续聊时不传，沿用记录里保存的系统提示词。 */
 	systemPrompt?: string;
 	/** 追加在系统提示词后面的内容，例如预加载的 skill。 */
@@ -176,7 +182,8 @@ export async function createChild(opts: ChildOptions): Promise<ChildHandle> {
 		noPromptTemplates: true,
 		systemPrompt: opts.systemPrompt,
 		appendSystemPrompt: opts.appendSystemPrompt,
-		extensionFactories: opts.extensionFactories,
+		extensionFactories: [...builtinMcpExtensions(), ...opts.extensionFactories],
+		disabledBuiltinExtensions: opts.disabledBuiltinExtensions,
 		extensionsOverride: (base) => ({ ...base, extensions: base.extensions.filter((e) => !opts.isSelfExtension(e.path)) }),
 	});
 	await loader.reload();
@@ -189,6 +196,7 @@ export async function createChild(opts: ChildOptions): Promise<ChildHandle> {
 		model: opts.model,
 		thinkingLevel: opts.thinkingLevel,
 		tools: opts.tools,
+		excludeTools: opts.excludeTools?.length ? opts.excludeTools : undefined,
 		resourceLoader: loader,
 		sessionManager,
 		settingsManager: opts.settingsManager,

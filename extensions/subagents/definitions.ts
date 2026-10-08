@@ -32,7 +32,7 @@ export interface AgentDefinition {
 	omitContextFiles?: boolean;
 	/** Claude Code 的 effort 取值，启动时映射到 pi 的 thinking level。 */
 	effort?: Effort;
-	/** 定义里的 mcpServers，由 pi-mcp-adapter 提供实际的 MCP 连接。 */
+	/** 定义里的 mcpServers，由 pi 内置的 MCP 提供实际连接，见 mcp.ts。 */
 	mcpServers?: AgentMcpServers;
 	color?: AgentColor;
 	/** 一次性 agent 不返回可续聊的 ID，只有内置的 Explore、Plan 是一次性的。 */
@@ -44,7 +44,7 @@ export interface AgentDefinition {
 
 /**
  * mcpServers 字段拆开后的两类条目，语义对齐 Claude Code：
- *   - refs：引用主会话已配置的服务名。子 agent 本来就继承主会话的全部服务，引用只起声明作用，不校验名字是否存在。
+ *   - refs：引用 mcp.json 里已配置的服务名。定义写了 tools 时，引用的服务的工具也会放开；不校验名字是否存在。
  *   - inline：只给这个子 agent 用的内联定义，子 agent 启动时注册、结束时随子会话断开，主会话看不到。
  */
 export interface AgentMcpServers {
@@ -52,7 +52,7 @@ export interface AgentMcpServers {
 	inline: InlineMcpServer[];
 }
 
-/** 一个内联 MCP 服务：config 与 .mcp.json 里的服务条目同一格式，原样交给 pi-mcp-adapter。 */
+/** 一个内联 MCP 服务：config 与 mcp.json 里的服务条目同一格式，原样交给 pi.registerMcpServer。 */
 export interface InlineMcpServer {
 	name: string;
 	config: Record<string, unknown>;
@@ -267,8 +267,21 @@ function toolCandidates(entry: string): string[] {
 }
 
 /**
+ * tools、disallowedTools 里的 MCP 条目换成工具名模式，不是 MCP 条目时返回 undefined。
+ * `mcp__` 开头的工具名或模式原样使用，写法与 Claude Code 相同。
+ * 旧写法 `mcp`（pi-mcp-adapter 的代理工具）等同全部 MCP 工具。
+ * MCP 工具在派出时可能还没连上，主会话的工具表里查不到，所以不按可用工具校验。
+ */
+export function mcpPattern(entry: string): string | undefined {
+	const bare = entry.trim();
+	if (bare.toLowerCase() === "mcp") return "mcp__*";
+	return bare.startsWith("mcp__") ? bare : undefined;
+}
+
+/**
  * 按定义里的 tools 与 disallowedTools 算出子 agent 实际拿到的工具。
  * available 是子 agent 可以继承的全部工具名。
+ * tools 里的 MCP 条目原样作为模式保留，见 mcpPattern。
  * 定义写了 tools 却一个都解析不到时返回错误，与 Claude Code「无法以零个工具启动」一致。
  */
 export function resolveTools(def: Pick<AgentDefinition, "tools" | "disallowedTools">, available: readonly string[]): { tools: string[] } | { error: string } {
@@ -277,14 +290,20 @@ export function resolveTools(def: Pick<AgentDefinition, "tools" | "disallowedToo
 	let tools: string[];
 	if (def.tools) {
 		const found = new Set<string>();
+		const mcp = new Set<string>();
 		const invalid: string[] = [];
 		for (const entry of def.tools) {
+			const pattern = mcpPattern(entry);
+			if (pattern) {
+				mcp.add(pattern);
+				continue;
+			}
 			const hits = lookup(entry);
 			if (hits.length) for (const h of hits) found.add(h);
 			else invalid.push(entry);
 		}
-		if (found.size === 0) return { error: `tools 里没有一项能对应到可用工具：${invalid.join("、")}。可用工具：${available.join("、")}` };
-		tools = available.filter((t) => found.has(t));
+		if (found.size === 0 && mcp.size === 0) return { error: `tools 里没有一项能对应到可用工具：${invalid.join("、")}。可用工具：${available.join("、")}` };
+		tools = [...available.filter((t) => found.has(t)), ...mcp];
 	} else {
 		tools = [...available];
 	}
