@@ -57,6 +57,8 @@ export default function subagents(pi: ExtensionAPI) {
 	let orch: Orchestrator | undefined;
 	let pending: Array<{ text: string; details: NotificationDetails }> = [];
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
+	/** TUI 忙时通知先安全落盘，再于回合末或最终可操作边界请求一次处理通知的续跑。 */
+	let notifyContinuation = false;
 	/** 每个 agent 上次写入主会话时的关键字段，没变就不再写。 */
 	const persisted = new Map<string, string>();
 	/** 用户在面板里清除过的 agent，只影响显示。 */
@@ -128,8 +130,9 @@ export default function subagents(pi: ExtensionAPI) {
 	/**
 	 * 把缓冲的通知作为一条消息送进主会话。
 	 * 主会话空闲时立即开始新一轮。
-	 * 运行中时默认按 steer 投递：当前工具调用结束后、下一次请求模型前送达，与 Claude Code 在下一个工具结果旁附上通知一致。
-	 * 不用 followUp 的原因：followUp 要等本轮彻底结束才送达，主 agent 若在本轮内用 sleep 之类的工具轮询等结果，两边会互相等死（实测 pictl 会话卡了 14 分钟）。
+	 * TUI 忙时交给 SDK 在当前回合的安全边界落盘，再由 turn_end 或 agent_before_settle 请求续跑，下一次模型请求即可处理通知。
+	 * 不能只放入 steer 队列，因为自动压缩失败触发的 TUI 中止会清空该队列，丢失尚未落盘的通知。
+	 * print 与 RPC 保留原有投递策略，不等待主会话整轮结束后才发送，避免工具轮询与后台通知互相等待。
 	 * @param deliverAs `-p` 模式在 agent_end 收尾时传 followUp，此时本轮已不会再调用工具，沿用实测通过的投递方式。
 	 */
 	const flushNotifications = (deliverAs: "steer" | "followUp" = "steer") => {
@@ -139,8 +142,21 @@ export default function subagents(pi: ExtensionAPI) {
 		if (!batch.length) return;
 		const content = batch.map((b) => b.text).join("\n\n---\n\n");
 		const details: NotificationDetails = { agents: batch.flatMap((b) => b.details.agents) };
-		pi.sendMessage({ customType: NOTIFY_TYPE, content, display: true, details }, { deliverAs, triggerTurn: true });
+		const deferToBoundary = ctxRef?.mode === "tui" && !ctxRef.isIdle();
+		if (deferToBoundary) notifyContinuation = true;
+		pi.sendMessage({ customType: NOTIFY_TYPE, content, display: true, details }, { deliverAs, triggerTurn: !deferToBoundary });
 	};
+
+	const continueNotifications = (_event: unknown, ctx: ExtensionContext) => {
+		if (!notifyContinuation) return;
+		notifyContinuation = false;
+		// 请求一次续跑而不是再发一条消息，保持通知唯一，中止的回合不得被本插件重新拉起。
+		if (!ctx.signal?.aborted) return { continue: true };
+	};
+	pi.on("turn_end", continueNotifications);
+	// 其他扩展的 agent_end 可能长时间等待，期间到达的通知由最终可操作边界处理。
+	pi.on("agent_before_settle", continueNotifications);
+	pi.on("agent_settled", () => { notifyContinuation = false; });
 
 	pi.registerFlag("agents", { description: "以 JSON 定义只在本次会话有效的 subagent，格式同 Claude Code 的 --agents", type: "string" });
 
@@ -195,6 +211,7 @@ export default function subagents(pi: ExtensionAPI) {
 		// 会话被替换（/new、/resume）时，上一个会话的 subagent 全部收尾，不带到新会话。
 		await orch?.shutdown();
 		ctxRef = ctx;
+		notifyContinuation = false;
 		orch = createOrchestrator(ctx);
 		persisted.clear();
 		lastStatus.clear();
@@ -307,6 +324,7 @@ export default function subagents(pi: ExtensionAPI) {
 		clearTimeout(flushTimer);
 		flushTimer = undefined;
 		pending = [];
+		notifyContinuation = false;
 		clearInterval(ticker);
 		ticker = undefined;
 		clearTimeout(hintTimer);

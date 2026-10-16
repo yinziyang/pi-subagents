@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import subagents from "../extensions/subagents/index.ts";
 
 export { fauxAssistantMessage, fauxText, fauxToolCall };
@@ -38,12 +38,20 @@ export interface HarnessOptions {
 	env?: Record<string, string>;
 	/** 写进 cwd/.pi/agents/ 的定义文件，键为文件名。 */
 	agents?: Record<string, string>;
-	/** 为 true 时模拟交互模式：ctx.hasUI 为真，界面调用全部是空操作。 */
+	/** 为 true 时模拟交互模式：ctx.hasUI 为真，界面调用默认是空操作。 */
 	ui?: boolean;
+	/** 可选的 widget 记录器，用于观察真实面板的挂载和渲染。 */
+	setWidget?: ExtensionUIContext["setWidget"];
+	/** 观察发送给 SDK 的消息，不改变原始发送参数，用于核实通知已提交但尚未消费的时序。 */
+	onSendMessage?: (message: Parameters<ExtensionAPI["sendMessage"]>[0]) => void;
+	/** 可选的 TUI 中止适配，使用 SDK 现有绑定入口模拟真实交互宿主的队列恢复行为。 */
+	abortHandler?: (session: Harness["session"]) => void;
 	/** 记录 ui.notify 的内容。 */
 	notes?: string[];
 	/** 为 true 时界面的 setStatus 抛异常，用来验证界面故障不影响 agent。 */
 	brokenUi?: boolean;
+	/** faux 模型上下文窗口，单位 token，省略时沿用 provider 默认值，用于真实阈值触发测试。 */
+	contextWindow?: number;
 	/** 合并进测试用 settings.json 的设置。 */
 	settings?: Record<string, unknown>;
 	/** 额外加载到主会话的扩展，例如订阅 pi.events 的监听器。 */
@@ -89,7 +97,7 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	}
 
 	const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
-	const faux = fauxProvider({ provider: "faux", models: [{ id: "m" }] });
+	const faux = fauxProvider({ provider: "faux", models: [{ id: "m", contextWindow: opts.contextWindow }] });
 	runtime.registerNativeProvider(faux.provider);
 	const model = runtime.getModel("faux", "m") ?? faux.getModel();
 	const requests: Request[] = [];
@@ -102,7 +110,15 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 	};
 	faux.setResponses(Array.from({ length: 500 }, () => step));
 
-	const loader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [subagents, ...(opts.extraExtensions ?? [])] });
+	const observedSubagents = (pi: ExtensionAPI) => {
+		const sendMessage = pi.sendMessage;
+		pi.sendMessage = (message, options) => {
+			opts.onSendMessage?.(message);
+			sendMessage(message, options);
+		};
+		subagents(pi);
+	};
+	const loader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [observedSubagents, ...(opts.extraExtensions ?? [])] });
 	await loader.reload();
 	const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, resourceLoader: loader, sessionManager: SessionManager.create(cwd, join(agentDir, "sessions")) });
 	if (opts.ui) {
@@ -112,13 +128,15 @@ export async function makeHarness(opts: HarnessOptions): Promise<Harness> {
 		const uiContext: any = { notify: (m: string) => opts.notes?.push(m) };
 		for (const k of ["setStatus", "setWidget", "setWorkingMessage", "setWorkingVisible", "setWorkingIndicator", "setHiddenThinkingLabel", "setFooter", "setHeader", "setTitle", "pasteToEditor", "setEditorText", "addAutocompleteProvider", "setEditorComponent", "setToolsExpanded", "onTerminalInput"]) uiContext[k] = noop;
 		for (const k of ["select", "input", "editor", "custom"]) uiContext[k] = async () => undefined;
+		if (opts.setWidget) uiContext.setWidget = opts.setWidget;
 		if (opts.select) uiContext.select = opts.select;
 		uiContext.confirm = async () => false;
 		uiContext.getEditorText = () => "";
 		if (opts.brokenUi) uiContext.setStatus = () => {
 			throw new Error("ui broken");
 		};
-		await session.bindExtensions({ mode: "tui", uiContext });
+		const abortHandler = opts.abortHandler;
+		await session.bindExtensions({ mode: "tui", uiContext, abortHandler: abortHandler ? () => abortHandler(session) : undefined });
 	} else {
 		await session.bindExtensions({ mode: "print" });
 	}
@@ -150,7 +168,8 @@ export const isGeneralPurpose = (req: Request) => req.system.includes("委派任
 export const isMain = (req: Request) => req.system.includes("You are an expert coding assistant operating inside pi");
 
 export const text = (t: string) => fauxAssistantMessage(fauxText(t));
-export const call = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
+/** 生成工具调用响应，参数遵循 SDK 的 JSON 值契约。 */
+export const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 
 /** 最后一条消息是不是某个工具的结果。 */
 export const lastToolResult = (req: Request) => (req.last?.role === "toolResult" ? req.last : undefined);
